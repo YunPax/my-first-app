@@ -4128,11 +4128,11 @@ export default function App() {
           const data = snap.data();
           if (data.characters && data.characters.length > 0) {
             setCharacters(data.characters);
-          } else {
-            await setDoc(docRef, { characters });
           }
+          if (data.accent) setAccent(data.accent);
+          if (data.dark !== undefined) setDark(data.dark);
         } else {
-          await setDoc(docRef, { characters });
+          await setDoc(docRef, { characters, accent, dark });
         }
         setIsSyncing(false);
       }
@@ -4149,9 +4149,15 @@ export default function App() {
     }
     if (user && !isSyncing) {
       const docRef = doc(db, "users", user.uid);
-      setDoc(docRef, { characters }, { merge: true });
+      setDoc(docRef, { characters, accent, dark }, { merge: true });
     }
-  }, [characters, user, isSyncing]);
+  }, [characters, accent, dark, user, isSyncing]);
+
+  useEffect(() => {
+    const bgColor = dark ? "#0a0a0a" : "#ffffff";
+    document.documentElement.style.backgroundColor = bgColor;
+    document.body.style.backgroundColor = bgColor;
+  }, [dark]);
 
   const handleLogin = async () => {
     try {
