@@ -48,10 +48,12 @@ const VARIANT_TAGS = [
   "Ground Variant",
   "Air Variant",
   "Crouch Variant",
-  "Enemy conditioned (if enemy is wall slamed, downslamed, uptlitled or spinning)",
+  "Enemy Stun Condition",
+  "Enemy Status Condition",
 ];
  
-const ENEMY_CONDITIONS = ["Wall Slammed", "Downslammed", "Uptilted", "Spinning"];
+const ENEMY_STUN_CONDITIONS = ["Wall Slammed", "Downslammed", "Uptilted", "Spinning"];
+const ENEMY_STATUS_CONDITIONS = ["Fire", "Freeze", "Blood", "Electricity", "Special"];
 
 /* Status Affliction — also carries elemental identity now. Element was
  * removed as a separate field; these five are the shipping set. */
@@ -2845,12 +2847,12 @@ const SubVariantEditor = ({ subvariant, updateSubvariant, removeSubvariant, char
         </div>
       </div>
  
-      {subvariant.tag === "Enemy conditioned (if enemy is wall slamed, downslamed, uptlitled or spinning)" && (
+      {(subvariant.tag === "Enemy Stun Condition" || subvariant.tag === "Enemy Status Condition") && (
         <div className="px-1.5 space-y-2">
           <div className="flex items-center gap-2">
             <Target size={11} className={t.faint} />
             <span className={`text-[10px] uppercase tracking-wider ${t.faint}`}>
-              Conditions
+              {subvariant.tag === "Enemy Stun Condition" ? "Stun Conditions" : "Status Conditions"}
             </span>
           </div>
           <div className="flex flex-wrap gap-1.5">
@@ -2874,22 +2876,22 @@ const SubVariantEditor = ({ subvariant, updateSubvariant, removeSubvariant, char
             ))}
           </div>
           <div className="flex flex-wrap gap-1">
-            {ENEMY_CONDITIONS.filter(
-              (c) => !(subvariant.conditions || []).includes(c)
-            ).map((cond) => (
-              <button
-                key={cond}
-                onClick={() =>
-                  updateSubvariant({
-                    ...subvariant,
-                    conditions: [...(subvariant.conditions || []), cond],
-                  })
-                }
-                className={`text-[10px] px-2 py-0.5 rounded-full border ${t.chipIdle} hover:border-current`}
-              >
-                + {cond}
-              </button>
-            ))}
+            {(subvariant.tag === "Enemy Stun Condition" ? ENEMY_STUN_CONDITIONS : ENEMY_STATUS_CONDITIONS)
+              .filter((c) => !(subvariant.conditions || []).includes(c))
+              .map((cond) => (
+                <button
+                  key={cond}
+                  onClick={() =>
+                    updateSubvariant({
+                      ...subvariant,
+                      conditions: [...(subvariant.conditions || []), cond],
+                    })
+                  }
+                  className={`text-[10px] px-2 py-0.5 rounded-full border ${t.chipIdle} hover:border-current`}
+                >
+                  + {cond}
+                </button>
+              ))}
           </div>
         </div>
       )}
@@ -4184,12 +4186,12 @@ const VariantEditor = ({
         </select>
       </div>
 
-      {variant.tag === "Enemy conditioned (if enemy is wall slamed, downslamed, uptlitled or spinning)" && (
+      {(variant.tag === "Enemy Stun Condition" || variant.tag === "Enemy Status Condition") && (
         <div className="mt-4 px-2">
           <div className="flex items-center gap-2 mb-2">
             <Target size={13} className={t.faint} />
             <span className={`text-[11px] uppercase tracking-wider ${t.faint}`}>
-              Enemy Conditions
+              {variant.tag === "Enemy Stun Condition" ? "Enemy Stun Conditions" : "Enemy Status Conditions"}
             </span>
           </div>
           <div className="flex flex-wrap gap-2 mb-3">
@@ -4217,22 +4219,22 @@ const VariantEditor = ({
             )}
           </div>
           <div className="flex flex-wrap gap-2">
-            {ENEMY_CONDITIONS.filter(
-              (c) => !(variant.conditions || []).includes(c)
-            ).map((cond) => (
-              <button
-                key={cond}
-                onClick={() =>
-                  updateVariant({
-                    ...variant,
-                    conditions: [...(variant.conditions || []), cond],
-                  })
-                }
-                className={`text-[11px] px-2.5 py-1 rounded-full border transition-all ${t.chipIdle} hover:border-current`}
-              >
-                + {cond}
-              </button>
-            ))}
+            {(variant.tag === "Enemy Stun Condition" ? ENEMY_STUN_CONDITIONS : ENEMY_STATUS_CONDITIONS)
+              .filter((c) => !(variant.conditions || []).includes(c))
+              .map((cond) => (
+                <button
+                  key={cond}
+                  onClick={() =>
+                    updateVariant({
+                      ...variant,
+                      conditions: [...(variant.conditions || []), cond],
+                    })
+                  }
+                  className={`text-[11px] px-2.5 py-1 rounded-full border transition-all ${t.chipIdle} hover:border-current`}
+                >
+                  + {cond}
+                </button>
+              ))}
           </div>
         </div>
       )}
