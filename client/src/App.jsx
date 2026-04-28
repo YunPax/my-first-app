@@ -35,6 +35,7 @@ import {
   Camera,
   Skull,
   Search,
+  Menu,
 } from "lucide-react";
 
 /* ===========================================================================
@@ -3247,7 +3248,7 @@ const MoveTree = ({
  * Character Profile Header
  * ======================================================================== */
 
-const CopyLuauButton = ({ character, t }) => {
+const CopyLuauButton = ({ character, t, className = "" }) => {
   const [state, setState] = useState("idle"); // idle | copied | error
   const timeoutRef = useRef(null);
 
@@ -3288,7 +3289,7 @@ const CopyLuauButton = ({ character, t }) => {
     <button
       onClick={copy}
       title="Copy Roblox Studio module script to clipboard"
-      className={`text-xs px-3 py-1.5 rounded-md border ${t.border} ${t.hover} inline-flex items-center gap-1.5 font-medium`}
+      className={`text-xs px-3 py-1.5 rounded-md border ${t.border} ${t.hover} inline-flex items-center gap-1.5 font-medium ${className}`}
     >
       <ChevronsUpDown size={12} className={t.accent} />
       {state === "copied"
@@ -3302,7 +3303,7 @@ const CopyLuauButton = ({ character, t }) => {
 
 const CharacterHeader = ({ character, updateCharacter, goToRoster, t }) => (
   <header className={`border-b ${t.border} pb-7 mb-8`}>
-    <div className="flex items-center gap-2 mb-3">
+    <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 mb-3">
       {goToRoster && (
         <button
           onClick={goToRoster}
@@ -3669,15 +3670,15 @@ const AnimeRosterCard = ({
       </div>
 
       <div
-        className={`flex items-center gap-2 mt-auto pt-2 border-t ${t.subBorder}`}
+        className={`flex flex-col sm:flex-row items-stretch sm:items-center gap-2 mt-auto pt-2 border-t ${t.subBorder}`}
       >
         <button
           onClick={onOpen}
-          className={`text-xs px-3 py-1.5 rounded-md border ${t.border} ${t.hover} inline-flex items-center gap-1 ${t.accent} font-medium`}
+          className={`text-xs px-3 py-2 sm:py-1.5 rounded-md border ${t.border} ${t.hover} inline-flex items-center justify-center gap-1 ${t.accent} font-medium w-full sm:w-auto`}
         >
           Open moveset <ChevronRight size={12} />
         </button>
-        <CopyLuauButton character={character} t={t} />
+        <CopyLuauButton character={character} t={t} className="w-full sm:w-auto py-2 sm:py-1.5 justify-center" />
       </div>
     </div>
   );
@@ -3721,9 +3722,9 @@ const RosterScreen = ({
   const totalShown = groups.reduce((acc, [, g]) => acc + g.length, 0);
 
   return (
-    <div className="max-w-6xl mx-auto px-10 py-10">
+    <div className="max-w-6xl mx-auto px-4 md:px-10 py-6 md:py-10">
       <header className={`border-b ${t.border} pb-6 mb-8`}>
-        <div className="flex items-end justify-between gap-4">
+        <div className="flex flex-col sm:flex-row items-start sm:items-end justify-between gap-4">
           <div className="min-w-0">
             <div className={`text-[11px] uppercase tracking-[0.18em] ${t.faint} font-medium`}>
               Anime Moveset Wiki
@@ -4112,6 +4113,7 @@ export default function App() {
   );
   const [expandedMoves, setExpandedMoves] = useState(() => new Set(["move1"]));
   const [minimizedCharacters, setMinimizedCharacters] = useState(() => new Set());
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   const [user, setUser] = useState(null);
   const [isAuthLoaded, setIsAuthLoaded] = useState(false);
@@ -4254,19 +4256,48 @@ export default function App() {
       {/* Inject the accent CSS classes into the document once. */}
       <style>{ACCENT_CSS}</style>
 
-      <div className="flex">
+      {/* Mobile Top Bar */}
+      <div className={`md:hidden flex items-center justify-between p-3 border-b ${t.border} ${t.surface} sticky top-0 z-40`}>
+        <div className="flex items-center gap-2 font-semibold">
+          <div className={`w-7 h-7 rounded flex items-center justify-center ${t.accentBg} ${t.accent}`}>
+            <Sparkles size={14} />
+          </div>
+          <span className="text-sm">Moveset Maker</span>
+        </div>
+        <button onClick={() => setIsMobileMenuOpen(true)} className={`p-1.5 rounded ${t.hover}`}>
+          <Menu size={20} />
+        </button>
+      </div>
+
+      <div className="flex flex-col md:flex-row">
+        {/* Sidebar Overlay for Mobile */}
+        {isMobileMenuOpen && (
+          <div 
+            className="fixed inset-0 bg-black/60 z-50 md:hidden backdrop-blur-sm"
+            onClick={() => setIsMobileMenuOpen(false)}
+          />
+        )}
+        
         {/* Sidebar */}
         <aside
-          className={`w-[300px] shrink-0 border-r ${t.sidebar} h-screen sticky top-0 flex flex-col`}
+          className={`
+            fixed inset-y-0 left-0 z-50 w-[85%] max-w-[320px] shrink-0 border-r ${t.sidebar} h-screen flex flex-col
+            transform transition-transform duration-300 ease-in-out bg-inherit
+            ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'}
+            md:relative md:translate-x-0 md:w-[300px] md:sticky md:top-0 md:z-auto
+          `}
         >
-          <div className={`px-4 py-4 border-b ${t.border}`}>
+          <div className={`px-4 py-4 border-b ${t.border} flex items-center justify-between`}>
             <button
-              onClick={goToRoster}
-              className="flex items-center gap-2 w-full text-left"
+              onClick={() => {
+                goToRoster();
+                setIsMobileMenuOpen(false);
+              }}
+              className="flex items-center gap-2 min-w-0 flex-1 text-left"
               title="Back to roster"
             >
               <div
-                className={`w-8 h-8 rounded-md flex items-center justify-center ${t.accentBg} ${t.accent}`}
+                className={`w-8 h-8 rounded-md flex items-center justify-center ${t.accentBg} ${t.accent} shrink-0`}
               >
                 <Sparkles size={16} />
               </div>
@@ -4275,10 +4306,15 @@ export default function App() {
                   Anime Moveset Wiki
                 </div>
                 <div className="font-semibold truncate text-sm">
-                  Roblox · {characters.length} character
-                  {characters.length === 1 ? "" : "s"}
+                  Roblox · {characters.length} character{characters.length === 1 ? "" : "s"}
                 </div>
               </div>
+            </button>
+            <button 
+              className={`md:hidden p-1.5 rounded ${t.hover} ml-2`}
+              onClick={() => setIsMobileMenuOpen(false)}
+            >
+              <X size={18} className={t.faint} />
             </button>
           </div>
 
@@ -4286,8 +4322,14 @@ export default function App() {
             <RosterSection
               characters={characters}
               activeCharacterId={view === "character" ? activeCharacterId : null}
-              selectCharacter={selectCharacter}
-              addCharacter={addCharacter}
+              selectCharacter={(id) => {
+                selectCharacter(id);
+                setIsMobileMenuOpen(false);
+              }}
+              addCharacter={() => {
+                addCharacter();
+                setIsMobileMenuOpen(false);
+              }}
               removeCharacter={removeCharacter}
               minimizedCharacters={minimizedCharacters}
               toggleMinimize={toggleMinimize}
@@ -4356,7 +4398,7 @@ export default function App() {
               t={t}
             />
           ) : (
-            <div className="max-w-4xl mx-auto px-10 py-12">
+            <div className="max-w-4xl mx-auto px-4 md:px-10 py-6 md:py-12">
             {character ? (
               <>
                 <CharacterHeader
