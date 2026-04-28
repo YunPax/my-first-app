@@ -1545,6 +1545,7 @@ const MediaItem = ({ item, t, onRemove, onRelabel }) => {
           controls
           playsInline
           className="w-full h-full bg-black"
+          referrerPolicy="no-referrer"
         />
       );
     }
@@ -1554,6 +1555,7 @@ const MediaItem = ({ item, t, onRemove, onRelabel }) => {
         <img
           src={displayUrl}
           className="w-full h-full object-contain bg-black/40"
+          referrerPolicy="no-referrer"
         />
       );
     }
