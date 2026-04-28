@@ -36,6 +36,7 @@ import {
   Skull,
   Search,
   Menu,
+  Loader,
 } from "lucide-react";
 
 /* ===========================================================================
@@ -1488,6 +1489,10 @@ const MEDIA_TYPE_META = {
 };
 
 const MediaItem = ({ item, t, onRemove, onRelabel }) => {
+  const [imageError, setImageError] = useState(false);
+  const [proxyAttempted, setProxyAttempted] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+
   let displayUrl = item.url;
   if (item.source === "file") {
     try {
@@ -1495,7 +1500,10 @@ const MediaItem = ({ item, t, onRemove, onRelabel }) => {
     } catch (err) {
       displayUrl = item.url;
     }
+  } else if (proxyAttempted) {
+    displayUrl = `https://corsproxy.io/?${encodeURIComponent(item.url)}`;
   }
+  
   const yt = youtubeId(item.url);
   const sm = streamableId(item.url);
   const Meta = MEDIA_TYPE_META[item.kind] || MEDIA_TYPE_META.link;
@@ -1557,13 +1565,42 @@ const MediaItem = ({ item, t, onRemove, onRelabel }) => {
       );
     }
     if (item.kind === "image") {
+      if (imageError) {
+        return (
+          <div className="w-full h-full flex flex-col items-center justify-center text-neutral-400 gap-2 p-3 bg-neutral-900/50">
+            <ImageIcon size={20} className="opacity-50" />
+            <span className="text-xs text-center text-red-400/80">Image Not Found</span>
+            <a href={displayUrl} target="_blank" rel="noreferrer" className="text-[10px] underline break-all text-center opacity-50">
+              {item.url}
+            </a>
+          </div>
+        );
+      }
       return (
-        // eslint-disable-next-line jsx-a11y/alt-text
-        <img
-          src={displayUrl}
-          className="w-full h-full object-contain bg-black/40"
-          referrerPolicy="no-referrer"
-        />
+        <div className="w-full h-full overflow-hidden flex items-center justify-center bg-black/40 relative">
+          {isLoading && !imageError && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-10">
+              <Loader className="animate-spin text-neutral-400" size={24} />
+            </div>
+          )}
+          {/* eslint-disable-next-line jsx-a11y/alt-text */}
+          <img
+            src={displayUrl}
+            className={`max-w-full max-h-full object-contain ${isLoading ? 'opacity-0' : 'opacity-100'} transition-opacity duration-300`}
+            referrerPolicy="no-referrer"
+            onLoad={() => setIsLoading(false)}
+            onError={() => {
+              if (!proxyAttempted && item.source === "link") {
+                setProxyAttempted(true);
+                setIsLoading(true);
+              } else {
+                console.error("Failed to load image:", displayUrl);
+                setImageError(true);
+                setIsLoading(false);
+              }
+            }}
+          />
+        </div>
       );
     }
     return (
@@ -1608,7 +1645,23 @@ const MediaGallery = ({ variant, updateVariant, t }) => {
 
   const addUrl = () => {
     if (!draft.trim()) return;
-    const url = draft.trim();
+    let url = draft.trim();
+
+    // Auto-fix Reddit Media links (extract the 'url=' parameter)
+    if (url.includes("reddit.com/media?url=")) {
+      try {
+        const urlParam = new URL(url).searchParams.get("url");
+        if (urlParam) url = decodeURIComponent(urlParam);
+      } catch (err) {
+        // Ignore if not parseable
+      }
+    }
+
+    // Auto-fix Tenor "view" links to point to the raw GIF
+    if (url.includes("tenor.com/view/") && !url.endsWith(".gif")) {
+      url = url.split("?")[0] + ".gif";
+    }
+
     const kind = detectMediaType(url);
     updateVariant({
       ...variant,
@@ -1622,8 +1675,20 @@ const MediaGallery = ({ variant, updateVariant, t }) => {
 
   const handleFiles = async (files) => {
     if (!files?.length) return;
+
+    // Filter out files that are too large (1MB limit for Firestore)
+    const validFiles = Array.from(files).filter(file => {
+      if (file.size > 1000000) {
+        window.alert(`File "${file.name}" is too large for cloud sync (Max 1MB).`);
+        return false;
+      }
+      return true;
+    });
+
+    if (!validFiles.length) return;
+
     const results = await Promise.allSettled(
-      Array.from(files).map(async (file) => {
+      validFiles.map(async (file) => {
         const bytes = new Uint8Array(await file.arrayBuffer());
         let binary = '';
         const chunkSize = 8192;
@@ -1639,7 +1704,8 @@ const MediaGallery = ({ variant, updateVariant, t }) => {
           });
         } catch (err) {
           // Fallback for web browser: use base64 data URL
-          localPath = `data:${file.type};base64,${btoa(binary)}`;
+          const mime = file.type || "application/octet-stream";
+          localPath = `data:${mime};base64,${btoa(binary)}`;
         }
         return {
           id: newId(),
