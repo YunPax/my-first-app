@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(npm cache *)",
+      "Bash(node -e \"require\\('./server.js'\\)\")",
+      "Bash(curl -s http://localhost:3001/api/characters)",
+      "Bash(kill %1)",
+      "Bash(npx vite *)",
+      "Bash(npm run *)",
+      "Bash(xargs kill *)",
+      "Bash(rustc --version)",
+      "Bash(cargo --version)",
+      "Bash(curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs)",
+      "Bash(sh -s -- -y)",
+      "Bash(sudo npm *)",
+      "Bash(chmod -R u+w ~/.npm/_cacache)"
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "anime-moveset-wiki",
+  "version": "1.0.0",
+  "description": "Local full-stack Roblox moveset designer",
+  "scripts": {
+    "dev": "concurrently --names \"API,UI\" --prefix-colors \"cyan,magenta\" \"node server.js\" \"npm --prefix client run dev\"",
+    "server": "node server.js"
+  },
+  "dependencies": {
+    "concurrently": "^8.2.2",
+    "express": "^4.18.2"
+  }
+}
