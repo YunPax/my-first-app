@@ -43,7 +43,15 @@ import {
  * Constants
  * ======================================================================== */
 
-const VARIANT_TAGS = ["Ground", "Aim", "Aerial", "Crouch", "Stun", "Dash-cancel"];
+const VARIANT_TAGS = [
+  "Special Variant",
+  "Ground Variant",
+  "Air Variant",
+  "Crouch Variant",
+  "Enemy conditioned (if enemy is wall slamed, downslamed, uptlitled or spinning)",
+];
+ 
+const ENEMY_CONDITIONS = ["Wall Slammed", "Downslammed", "Uptilted", "Spinning"];
 
 /* Status Affliction — also carries elemental identity now. Element was
  * removed as a separate field; these five are the shipping set. */
@@ -493,6 +501,7 @@ const makeVariant = (tag = "Ground", type = "Attack", subtype = null) => {
     flavor: "",
     combo: "",
     scaling: "",
+    conditions: [],
   };
 };
 
@@ -2835,6 +2844,55 @@ const SubVariantEditor = ({ subvariant, updateSubvariant, removeSubvariant, char
           <ConfirmDelete onConfirm={removeSubvariant} t={t} title="Remove sub-variant" />
         </div>
       </div>
+ 
+      {subvariant.tag === "Enemy conditioned (if enemy is wall slamed, downslamed, uptlitled or spinning)" && (
+        <div className="px-1.5 space-y-2">
+          <div className="flex items-center gap-2">
+            <Target size={11} className={t.faint} />
+            <span className={`text-[10px] uppercase tracking-wider ${t.faint}`}>
+              Conditions
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {(subvariant.conditions || []).map((cond) => (
+              <div
+                key={cond}
+                className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border ${t.accentBg} ${t.accent} ${t.border}`}
+              >
+                {cond}
+                <button
+                  onClick={() =>
+                    updateSubvariant({
+                      ...subvariant,
+                      conditions: (subvariant.conditions || []).filter((c) => c !== cond),
+                    })
+                  }
+                >
+                  <X size={8} />
+                </button>
+              </div>
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {ENEMY_CONDITIONS.filter(
+              (c) => !(subvariant.conditions || []).includes(c)
+            ).map((cond) => (
+              <button
+                key={cond}
+                onClick={() =>
+                  updateSubvariant({
+                    ...subvariant,
+                    conditions: [...(subvariant.conditions || []), cond],
+                  })
+                }
+                className={`text-[10px] px-2 py-0.5 rounded-full border ${t.chipIdle} hover:border-current`}
+              >
+                + {cond}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       <SpecSheet variant={subvariant} updateVariant={updateSubvariant} t={t} />
     </div>
@@ -4125,6 +4183,59 @@ const VariantEditor = ({
           ))}
         </select>
       </div>
+
+      {variant.tag === "Enemy conditioned (if enemy is wall slamed, downslamed, uptlitled or spinning)" && (
+        <div className="mt-4 px-2">
+          <div className="flex items-center gap-2 mb-2">
+            <Target size={13} className={t.faint} />
+            <span className={`text-[11px] uppercase tracking-wider ${t.faint}`}>
+              Enemy Conditions
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-2 mb-3">
+            {(variant.conditions || []).map((cond) => (
+              <div
+                key={cond}
+                className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-medium border ${t.accentBg} ${t.accent} ${t.border}`}
+              >
+                {cond}
+                <button
+                  onClick={() =>
+                    updateVariant({
+                      ...variant,
+                      conditions: variant.conditions.filter((c) => c !== cond),
+                    })
+                  }
+                  className="hover:opacity-70 transition-opacity"
+                >
+                  <X size={10} />
+                </button>
+              </div>
+            ))}
+            {(variant.conditions || []).length === 0 && (
+              <span className={`text-xs ${t.faint} italic`}>No conditions added yet.</span>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {ENEMY_CONDITIONS.filter(
+              (c) => !(variant.conditions || []).includes(c)
+            ).map((cond) => (
+              <button
+                key={cond}
+                onClick={() =>
+                  updateVariant({
+                    ...variant,
+                    conditions: [...(variant.conditions || []), cond],
+                  })
+                }
+                className={`text-[11px] px-2.5 py-1 rounded-full border transition-all ${t.chipIdle} hover:border-current`}
+              >
+                + {cond}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="mt-6 mb-4">
         <TypePicker variant={variant} updateVariant={updateVariant} t={t} />
