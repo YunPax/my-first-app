@@ -1,5 +1,9 @@
 import { useState, useMemo, useRef, useEffect } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { auth, db, provider } from "./firebase";
+import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
+import { doc, getDoc, setDoc } from "firebase/firestore";
+
 import {
   ChevronDown,
   ChevronRight,
@@ -30,9 +34,7 @@ import {
   User2,
   Camera,
   Skull,
-  Check,
-  AlertCircle,
-  Loader2,
+  Search,
 } from "lucide-react";
 
 /* ===========================================================================
@@ -41,41 +43,47 @@ import {
 
 const VARIANT_TAGS = ["Ground", "Aim", "Aerial", "Crouch", "Stun", "Dash-cancel"];
 
-const ELEMENTS = [
-  "None",
-  "Fire",
-  "Ice",
-  "Lightning",
-  "Wind",
-  "Earth",
-  "Water",
-  "Light",
-  "Dark",
-  "Void",
-  "Spirit",
-];
-
+/* Status Affliction — also carries elemental identity now. Element was
+ * removed as a separate field; these five are the shipping set. */
 const STATUSES = [
   "None",
-  "Burn",
-  "Freeze",
-  "Shock",
   "Bleed",
+  "Fire",
   "Poison",
-  "Stun",
-  "Slow",
-  "Silence",
-  "Knockdown",
-  "Launch",
-  "Disarm",
+  "Freeze",
+  "Electricity",
 ];
+
+/* Move type definitions — each type has its own classification + spec schema
+ * and default keyframe markers (Roblox KeyframeReached events).             */
+
+/* Move-type system — two-level.
+ *
+ *   Primary type: one of Attack, Defense, Special.
+ *   Subtype:      refines behaviour within a primary type.
+ *
+ *     Attack   → Physical, Projectile, Special
+ *     Defense  → Evasive, Defense, Buff, Enemy Nerf
+ *     Special  → SubMode, Awakening, Transformation, Buff, Utility, Other
+ *
+ * Spec field "kinds":
+ *   "text"   — single text input (the default; no kind field needed).
+ *   "stun"   — composite: { duration, priority }.
+ *   "endlag" — composite: { success, fail }.
+ *   "hitbox" — toggleable:
+ *                mode="Size"   → { x, y, z, offsetX, offsetY, offsetZ }
+ *                mode="Radius" → { radius }
+ *
+ *   (Custom variable interactions live outside the spec array — see
+ *   VariableInteractionsSection. Resource Cost is intentionally absent.)
+ */
 
 const MOVE_TYPES = {
   Attack: {
     icon: Swords,
-    blurb: "Standard melee strike with a hitbox.",
+    blurb: "Deals damage through a hitbox — melee, projectile, or special.",
+    subtypes: ["Physical", "Projectile", "Special"],
     classification: [
-      { key: "element", label: "Element", options: ELEMENTS },
       { key: "status", label: "Status Affliction", options: STATUSES },
       {
         key: "hitProperty",
@@ -83,9 +91,19 @@ const MOVE_TYPES = {
         options: ["High", "Mid", "Low", "Overhead", "Unblockable"],
       },
       {
-        key: "onHit",
-        label: "On-Hit Reaction",
-        options: ["Hitstun", "Knockback", "Launcher", "Knockdown", "Wall Splat"],
+        key: "stunType",
+        label: "Stun Type",
+        options: ["Normal", "Spin", "Wall", "Downslam", "Uptilt"],
+      },
+      {
+        key: "blockable",
+        label: "Blockable?",
+        options: ["Yes", "No", "Only with parry"],
+      },
+      {
+        key: "cutscene",
+        label: "Cutscene Style",
+        options: ["None", "Grab", "Cinematic"],
       },
     ],
     spec: [
@@ -97,6 +115,55 @@ const MOVE_TYPES = {
       { key: "stun", label: "Stun", kind: "stun" },
       { key: "hitbox", label: "Hitbox", kind: "hitbox" },
     ],
+    /* Per-subtype spec fields. Appended to the base spec inside the Spec
+     * Sheet — gives each subtype its own "personality" without forcing a
+     * full schema split.                                                   */
+    subtypeSpec: {
+      Physical: [
+        { key: "reach", label: "Reach (studs)", placeholder: "5" },
+        {
+          key: "hitCount",
+          label: "Hit Count",
+          kind: "picker",
+          options: ["Single", "2 hits", "3 hits", "4+ hits"],
+        },
+        { key: "pushback", label: "Pushback (studs)", placeholder: "3" },
+      ],
+      Projectile: [
+        {
+          key: "trajectory",
+          label: "Trajectory",
+          kind: "picker",
+          options: ["Linear", "Bezier", "Double Bezier", "Homing"],
+        },
+        {
+          key: "aimMode",
+          label: "Aim Mode",
+          kind: "picker",
+          options: ["Cursor Aim", "Character Aim", "Auto Aim", "Locked Forward"],
+        },
+        { key: "projectileCount", label: "Projectile Count", placeholder: "1" },
+        { key: "projectileSpeed", label: "Projectile Speed (studs/s)", placeholder: "120" },
+        { key: "projectileLifetime", label: "Lifetime (s)", placeholder: "2.0" },
+        { key: "aoeRadius", label: "AOE Radius (studs)", placeholder: "0" },
+        {
+          key: "pierce",
+          label: "Pierce",
+          kind: "picker",
+          options: ["No", "1 target", "Unlimited"],
+        },
+      ],
+      Special: [
+        { key: "chargeTime", label: "Charge Time (s)", placeholder: "0.50" },
+        {
+          key: "multiStage",
+          label: "Multi-Stage",
+          kind: "picker",
+          options: ["Single", "2 stages", "3+ stages"],
+        },
+        { key: "aoeRadius", label: "AOE Radius (studs)", placeholder: "0" },
+      ],
+    },
     defaultMarkers: [
       { name: "WindupEnd", time: "0.20", track: "player" },
       { name: "HitboxStart", time: "0.30", track: "player" },
@@ -104,201 +171,114 @@ const MOVE_TYPES = {
       { name: "RecoveryEnd", time: "1.20", track: "player" },
     ],
   },
-  Special: {
-    icon: Sparkles,
-    blurb: "A unique signature ability that doesn't fit any other type.",
-    classification: [
-      { key: "element", label: "Element", options: ELEMENTS },
-      { key: "status", label: "Status Affliction", options: STATUSES },
-      {
-        key: "category",
-        label: "Special Category",
-        options: ["Offensive", "Defensive", "Setup", "Mobility", "Utility"],
-      },
-      {
-        key: "interruptible",
-        label: "Interruptible?",
-        options: ["No", "Yes — by attack", "Yes — by parry"],
-      },
-    ],
-    spec: [
-      { key: "resourceCost", label: "Resource Cost", placeholder: "25 Spirit" },
-      { key: "cooldown", label: "Cooldown (s)", placeholder: "8" },
-      { key: "damage", label: "Damage (optional)", placeholder: "—" },
-      { key: "effectDuration", label: "Effect Duration (s)", placeholder: "3" },
-      { key: "stun", label: "Stun (optional)", kind: "stun" },
-    ],
-    defaultMarkers: [
-      { name: "EffectStart", time: "0.30", track: "player" },
-      { name: "EffectEnd", time: "1.00", track: "player" },
-      { name: "RecoveryEnd", time: "1.40", track: "player" },
-    ],
-  },
-  Projectile: {
-    icon: Target,
-    blurb: "Spawns a travelling projectile.",
-    classification: [
-      { key: "element", label: "Element", options: ELEMENTS },
-      { key: "status", label: "Status Affliction", options: STATUSES },
-      {
-        key: "behavior",
-        label: "Projectile Behavior",
-        options: ["Straight", "Homing", "Arcing", "Boomerang", "Pierce"],
-      },
-      {
-        key: "destructible",
-        label: "Destructible?",
-        options: ["Yes — any hit", "Only by parry", "No"],
-      },
-    ],
-    spec: [
-      { key: "damage", label: "Damage on Hit", placeholder: "20" },
-      { key: "speed", label: "Projectile Speed (studs/s)", placeholder: "60" },
-      { key: "lifetime", label: "Lifetime (s)", placeholder: "2" },
-      { key: "cooldown", label: "Cooldown (s)", placeholder: "3" },
-      { key: "endlag", label: "Endlag", kind: "endlag" },
-      { key: "stun", label: "Stun", kind: "stun" },
-      { key: "hitbox", label: "Hitbox", kind: "hitbox" },
-    ],
-    defaultMarkers: [
-      { name: "WindupEnd", time: "0.30", track: "player" },
-      { name: "ProjectileSpawn", time: "0.40", track: "player" },
-      { name: "RecoveryEnd", time: "0.90", track: "player" },
-    ],
-  },
-  Hitscan: {
-    icon: Crosshair,
-    blurb: "Instantaneous ranged strike — no travel time.",
-    classification: [
-      { key: "element", label: "Element", options: ELEMENTS },
-      { key: "status", label: "Status Affliction", options: STATUSES },
-      {
-        key: "blockable",
-        label: "Blockable?",
-        options: ["Yes", "No", "Only with parry"],
-      },
-    ],
-    spec: [
-      { key: "damage", label: "Damage", placeholder: "15" },
-      { key: "range", label: "Range (studs)", placeholder: "80" },
-      { key: "cooldown", label: "Cooldown (s)", placeholder: "1" },
-      { key: "endlag", label: "Endlag", kind: "endlag" },
-      { key: "stun", label: "Stun", kind: "stun" },
-    ],
-    defaultMarkers: [
-      { name: "AimReady", time: "0.20", track: "player" },
-      { name: "Fire", time: "0.35", track: "player" },
-      { name: "RecoveryEnd", time: "0.70", track: "player" },
-    ],
-  },
-  Counter: {
+  Defense: {
     icon: Shield,
-    blurb: "Reactive ability triggered by an incoming attack.",
+    blurb: "Evasion, block, counter, debuff — protective or disruptive tools.",
+    subtypes: ["Evasive", "Defense", "Buff", "Enemy Nerf"],
     classification: [
-      { key: "element", label: "Counter Element", options: ELEMENTS },
-      { key: "status", label: "Status on Trigger", options: STATUSES },
+      { key: "status", label: "Status Applied", options: STATUSES },
       {
-        key: "counters",
-        label: "Counters",
-        options: ["Melee only", "Projectile only", "Both", "Throws"],
+        key: "target",
+        label: "Target",
+        options: ["Self", "Allies", "Enemies", "AoE around self"],
       },
       {
-        key: "outcome",
-        label: "On Successful Counter",
-        options: ["Stagger", "Reposition", "Damage burst", "Disarm"],
-      },
-    ],
-    spec: [
-      { key: "counterWindow", label: "Counter Window (s)", placeholder: "0.40" },
-      { key: "reactionDamage", label: "Reaction Damage", placeholder: "30" },
-      { key: "cooldown", label: "Cooldown (s)", placeholder: "12" },
-      { key: "stun", label: "Stun on Trigger", kind: "stun" },
-    ],
-    defaultMarkers: [
-      { name: "ParryWindowStart", time: "0.05", track: "player" },
-      { name: "ParryWindowEnd", time: "0.45", track: "player" },
-      { name: "ReactionTrigger", time: "0.50", track: "player" },
-    ],
-  },
-  Movement: {
-    icon: Wind,
-    blurb: "Mobility tool — dash, dodge, teleport.",
-    classification: [
-      {
-        key: "direction",
-        label: "Direction",
-        options: ["Forward", "Back", "8-way", "Towards Target"],
+        key: "trigger",
+        label: "Trigger",
+        options: ["Manual", "On block", "On hit", "On low HP", "Always on"],
       },
       {
         key: "iframes",
         label: "I-frames",
         options: ["None", "Partial", "Full"],
       },
-      {
-        key: "cancellable",
-        label: "Cancellable Into",
-        options: ["Any move", "Specials only", "Nothing"],
-      },
     ],
     spec: [
+      { key: "cooldown", label: "Cooldown (s)", placeholder: "4" },
+      { key: "duration", label: "Duration (s)", placeholder: "2" },
       { key: "distance", label: "Distance (studs)", placeholder: "20" },
       { key: "speed", label: "Speed (studs/s)", placeholder: "80" },
       { key: "iframeWindow", label: "I-frame Window (s)", placeholder: "0.30" },
-      { key: "cooldown", label: "Cooldown (s)", placeholder: "4" },
+      { key: "effect", label: "Effect Magnitude", placeholder: "+25% defense" },
       { key: "endlag", label: "Endlag", kind: "endlag" },
+      { key: "stun", label: "Stun on Target", kind: "stun" },
     ],
+    subtypeSpec: {
+      Evasive: [
+        {
+          key: "direction",
+          label: "Direction",
+          kind: "picker",
+          options: ["Forward", "Backward", "Lateral", "Free 8-way", "Toward Cursor"],
+        },
+        { key: "iframeStart", label: "I-Frame Start (s)", placeholder: "0.0" },
+        { key: "cancelWindow", label: "Cancel Window (s)", placeholder: "0.20" },
+      ],
+      Defense: [
+        {
+          key: "blockType",
+          label: "Block Type",
+          kind: "picker",
+          options: ["Block", "Parry", "Reflect", "Absorb"],
+        },
+        {
+          key: "coverage",
+          label: "Coverage",
+          kind: "picker",
+          options: ["High Only", "Mid Only", "Low Only", "All"],
+        },
+        { key: "damageReduction", label: "Damage Reduction", placeholder: "50%" },
+        { key: "parryWindow", label: "Parry Window (s)", placeholder: "0.10" },
+      ],
+      Buff: [
+        {
+          key: "stat",
+          label: "Stat Affected",
+          kind: "picker",
+          options: ["Damage", "Defense", "Speed", "Cooldown", "Custom"],
+        },
+        { key: "magnitude", label: "Magnitude", placeholder: "+25%" },
+        { key: "stacks", label: "Max Stacks", placeholder: "1" },
+      ],
+      "Enemy Nerf": [
+        {
+          key: "stat",
+          label: "Stat Affected",
+          kind: "picker",
+          options: ["Damage", "Defense", "Speed", "Healing", "Custom"],
+        },
+        { key: "magnitude", label: "Magnitude", placeholder: "-25%" },
+        { key: "range", label: "Range (studs)", placeholder: "30" },
+        {
+          key: "targets",
+          label: "Targets",
+          kind: "picker",
+          options: ["Single", "Frontline", "AoE around target", "All in range"],
+        },
+      ],
+    },
     defaultMarkers: [
-      { name: "DashStart", time: "0.10", track: "player" },
-      { name: "InvulStart", time: "0.10", track: "player" },
-      { name: "InvulEnd", time: "0.40", track: "player" },
-      { name: "DashEnd", time: "0.45", track: "player" },
+      { name: "StartUp", time: "0.10", track: "player" },
+      { name: "EffectStart", time: "0.15", track: "player" },
+      { name: "EffectEnd", time: "0.50", track: "player" },
+      { name: "RecoveryEnd", time: "0.70", track: "player" },
     ],
   },
-  Grab: {
-    icon: Crosshair,
-    blurb: "Command grab or cinematic finisher.",
+  Special: {
+    icon: Sparkles,
+    blurb: "Signature ability — sub-modes, awakenings, transformations.",
+    subtypes: ["SubMode", "Awakening", "Transformation", "Buff", "Utility", "Other"],
     classification: [
-      { key: "element", label: "Element", options: ELEMENTS },
-      { key: "status", label: "Status Affliction", options: STATUSES },
+      { key: "status", label: "Status Applied", options: STATUSES },
       {
-        key: "tech",
-        label: "Tech-able?",
-        options: ["No", "Yes — break window", "Only with parry"],
+        key: "category",
+        label: "Category",
+        options: ["Offensive", "Defensive", "Setup", "Mobility", "Utility"],
       },
       {
-        key: "cutscene",
-        label: "Cutscene Style",
-        options: ["None", "Cinematic"],
-      },
-    ],
-    spec: [
-      { key: "grabRange", label: "Grab Range (studs)", placeholder: "5" },
-      { key: "damage", label: "Total Damage", placeholder: "60" },
-      { key: "cinematicLength", label: "Cinematic Length (s)", placeholder: "3" },
-      { key: "cooldown", label: "Cooldown (s)", placeholder: "15" },
-      { key: "stun", label: "Stun on Release", kind: "stun" },
-      { key: "hitbox", label: "Grab Hitbox", kind: "hitbox" },
-    ],
-    defaultMarkers: [
-      { name: "GrabHitbox", time: "0.30", track: "player" },
-      { name: "CinematicStart", time: "0.40", track: "player" },
-      { name: "CinematicEnd", time: "3.40", track: "player" },
-      { name: "VictimGrabbed", time: "0.30", track: "enemy" },
-      { name: "VictimReact", time: "0.60", track: "enemy" },
-      { name: "VictimRelease", time: "3.40", track: "enemy" },
-      { name: "CameraZoomIn", time: "0.40", track: "camera" },
-      { name: "CameraOrbit", time: "1.20", track: "camera" },
-      { name: "CameraReset", time: "3.40", track: "camera" },
-    ],
-  },
-  Buff: {
-    icon: Star,
-    blurb: "Self-buff or stat modifier — no direct damage.",
-    classification: [
-      {
-        key: "scope",
-        label: "Buff Scope",
-        options: ["Self", "Allies", "AoE around self"],
+        key: "interruptible",
+        label: "Interruptible?",
+        options: ["No", "Yes — by attack", "Yes — by parry"],
       },
       {
         key: "stackable",
@@ -307,52 +287,145 @@ const MOVE_TYPES = {
       },
     ],
     spec: [
-      { key: "duration", label: "Buff Duration (s)", placeholder: "10" },
+      { key: "cooldown", label: "Cooldown (s)", placeholder: "8" },
+      { key: "duration", label: "Duration (s)", placeholder: "10" },
+      { key: "effectDuration", label: "Effect Duration (s)", placeholder: "3" },
       { key: "effect", label: "Effect Magnitude", placeholder: "+25% damage" },
-      { key: "resourceCost", label: "Resource Cost", placeholder: "40 Spirit" },
-      { key: "cooldown", label: "Cooldown (s)", placeholder: "20" },
+      { key: "damage", label: "Damage (optional)", placeholder: "—" },
+      { key: "stun", label: "Stun (optional)", kind: "stun" },
     ],
+    subtypeSpec: {
+      SubMode: [
+        {
+          key: "enterCondition",
+          label: "Enter Condition",
+          kind: "picker",
+          options: [
+            "Manual",
+            "On meter full",
+            "On HP threshold",
+            "On stack threshold",
+          ],
+        },
+        {
+          key: "exitCondition",
+          label: "Exit Condition",
+          kind: "picker",
+          options: [
+            "Timer",
+            "Manual cancel",
+            "On hit",
+            "On block",
+            "On meter empty",
+          ],
+        },
+        { key: "replacesMoves", label: "Replaces Moves", placeholder: "M1, M2, M3" },
+        { key: "meterCost", label: "Meter Cost", placeholder: "0" },
+      ],
+      Awakening: [
+        { key: "meterCost", label: "Meter Cost", placeholder: "100" },
+        { key: "threshold", label: "Threshold", placeholder: "Below 30% HP" },
+        { key: "maxDuration", label: "Max Duration (s)", placeholder: "20" },
+        {
+          key: "replacesMoveset",
+          label: "Moveset Behavior",
+          kind: "picker",
+          options: [
+            "Replaces all moves",
+            "Adds submoves only",
+            "No change — buff only",
+          ],
+        },
+      ],
+      Transformation: [
+        { key: "meterCost", label: "Meter Cost", placeholder: "100" },
+        {
+          key: "replacesMesh",
+          label: "Replaces Mesh?",
+          kind: "picker",
+          options: ["Yes", "No"],
+        },
+        {
+          key: "replacesMoveset",
+          label: "Moveset Behavior",
+          kind: "picker",
+          options: [
+            "Replaces all moves",
+            "Adds submoves only",
+            "No change — buff only",
+          ],
+        },
+      ],
+      Buff: [
+        {
+          key: "stat",
+          label: "Stat Affected",
+          kind: "picker",
+          options: ["Damage", "Defense", "Speed", "Cooldown", "Custom"],
+        },
+        { key: "magnitude", label: "Magnitude", placeholder: "+25%" },
+        { key: "stacks", label: "Max Stacks", placeholder: "1" },
+      ],
+      Utility: [
+        {
+          key: "utilityKind",
+          label: "Utility Kind",
+          kind: "picker",
+          options: [
+            "Mobility",
+            "Traversal",
+            "Healing",
+            "Resource Gen",
+            "Setup",
+            "Misc",
+          ],
+        },
+        { key: "chargeUses", label: "Charges", placeholder: "1" },
+        { key: "range", label: "Range (studs)", placeholder: "20" },
+      ],
+      Other: [],
+    },
     defaultMarkers: [
-      { name: "BuffApply", time: "0.30", track: "player" },
-      { name: "AnimationEnd", time: "0.80", track: "player" },
-    ],
-  },
-  Transformation: {
-    icon: Flame,
-    blurb: "Form change — alters stats or unlocks new moves.",
-    classification: [
-      {
-        key: "trigger",
-        label: "Trigger Condition",
-        options: ["Manual", "On low HP", "Meter full", "Story flag"],
-      },
-      {
-        key: "effect",
-        label: "Form Effect",
-        options: ["New moveset", "Stat boost", "Both", "Unique gauge"],
-      },
-    ],
-    spec: [
-      { key: "duration", label: "Form Duration (s)", placeholder: "30" },
-      { key: "resourceCost", label: "Resource Cost", placeholder: "100 Spirit" },
-      { key: "cooldown", label: "Cooldown after end (s)", placeholder: "60" },
-    ],
-    defaultMarkers: [
-      { name: "TransformStart", time: "0.00", track: "player" },
-      { name: "TransformPeak", time: "1.50", track: "player" },
-      { name: "TransformEnd", time: "2.50", track: "player" },
+      { name: "EffectStart", time: "0.30", track: "player" },
+      { name: "EffectEnd", time: "1.00", track: "player" },
+      { name: "RecoveryEnd", time: "1.40", track: "player" },
     ],
   },
 };
 
+/* Icon hint per subtype — used in the tree + editor for visual flavor. */
+const SUBTYPE_ICON = {
+  Physical: Swords,
+  Projectile: Target,
+  Special: Sparkles,
+  Evasive: Wind,
+  Defense: Shield,
+  Buff: Star,
+  "Enemy Nerf": Skull,
+  SubMode: Flame,
+  Awakening: Flame,
+  Transformation: Flame,
+  Utility: Gauge,
+  Other: Sparkles,
+};
+
 const MOVE_TYPE_KEYS = Object.keys(MOVE_TYPES);
 
+/* Icon for a variant — prefer the subtype icon, fall back to primary. */
+const iconForVariant = (v) =>
+  (v?.subtype && SUBTYPE_ICON[v.subtype]) ||
+  MOVE_TYPES[v?.type || "Attack"].icon;
+
+/* Determine which marker tracks should be visible for a given variant.
+ * Any variant flagged as a cinematic interaction (classification.cutscene
+ * === "Cinematic") gets enemy + camera tracks so you can author the grab /
+ * throw / finisher like a cutscene.                                         */
 const tracksFor = (variant) => {
-  if (variant.type === "Grab") {
-    const hasCutscene = variant.classification?.cutscene === "Cinematic";
-    return hasCutscene
-      ? ["player", "enemy", "camera"]
-      : ["player", "enemy"];
+  if (variant.classification?.cutscene === "Cinematic") {
+    return ["player", "enemy", "camera"];
+  }
+  if (variant.classification?.cutscene === "Grab") {
+    return ["player", "enemy"];
   }
   return ["player"];
 };
@@ -363,6 +436,7 @@ const TRACK_META = {
   camera: { label: "Camera Cutscene", Icon: Camera },
 };
 
+/* Default move slots — utility/awakening flagged for special handling */
 const DEFAULT_SLOTS = [
   { key: "move1", label: "Move 1", removable: false },
   { key: "move2", label: "Move 2", removable: false },
@@ -387,28 +461,69 @@ const seedMarkersForType = (type) =>
     description: "",
   }));
 
-const makeVariant = (tag = "Ground", type = "Attack") => ({
-  id: newId(),
-  tag,
-  type,
-  classification: {},
-  spec: {},
-  markers: seedMarkersForType(type),
-  media: [],
-  flavor: "",
-  combo: "",
-  scaling: "",
-});
+const makeVariant = (tag = "Ground", type = "Attack", subtype = null) => {
+  const primary = MOVE_TYPES[type] ? type : "Attack";
+  const sub =
+    subtype && MOVE_TYPES[primary].subtypes.includes(subtype)
+      ? subtype
+      : MOVE_TYPES[primary].subtypes[0];
+  return {
+    id: newId(),
+    tag,
+    type: primary,
+    subtype: sub,
+    classification: {},
+    spec: {},
+    /* Map of passive-variable-id → { effect, note }. Populated from the
+     * Variable Interactions editor once the owning character defines
+     * passive variables.                                                   */
+    variableInteractions: {},
+    /* Cross-references to other variants / moves / passives on the same
+     * character. Each entry: { id, kind: "variant"|"move"|"passive",
+     * targetId, subTargetId (optional for variant inside move), note }.   */
+    references: [],
+    /* Only used when subtype === "Awakening" — a nested sub-moveset the
+     * character can execute while awakened. Each entry is shaped like a
+     * top-level move (name, description, variants).                       */
+    submoves: [],
+    markers: seedMarkersForType(primary),
+    media: [],
+    flavor: "",
+    combo: "",
+    scaling: "",
+  };
+};
 
-const makeMove = (type = "Attack") => ({
+const makeMove = (type = "Attack", subtype = null) => ({
   name: "",
   description: "",
-  variants: [makeVariant("Ground", type)],
+  variants: [makeVariant("Ground", type, subtype)],
 });
 
 const makeFinisher = (kind = "Awakening") => ({
-  ...makeMove("Special"),
+  ...makeMove("Special", "Awakening"),
   finisherKind: kind,
+});
+
+/* Passive abilities — persistent effects / state tables. Each passive can
+ * declare variables that any move variant can then "bind to" via the
+ * Variable Interactions editor in its Spec Sheet.                         */
+const makePassive = (overrides = {}) => ({
+  id: newId(),
+  name: "",
+  description: "",
+  variables: [],
+  references: [],
+  ...overrides,
+});
+
+const makePassiveVariable = (overrides = {}) => ({
+  id: newId(),
+  name: "",
+  kind: "number",
+  initial: "",
+  description: "",
+  ...overrides,
 });
 
 const makeCharacter = (overrides = {}) => ({
@@ -418,13 +533,14 @@ const makeCharacter = (overrides = {}) => ({
   gimmick: "",
   enabledSlots: ["move1", "move2", "move3", "move4", "utility", "awakening"],
   moves: {
-    move1: makeMove("Attack"),
-    move2: makeMove("Attack"),
-    move3: makeMove("Projectile"),
-    move4: makeMove("Special"),
-    utility: makeMove("Movement"),
+    move1: makeMove("Attack", "Physical"),
+    move2: makeMove("Attack", "Physical"),
+    move3: makeMove("Attack", "Projectile"),
+    move4: makeMove("Special", "SubMode"),
+    utility: makeMove("Defense", "Evasive"),
     awakening: makeFinisher("Awakening"),
   },
+  passives: [],
   ...overrides,
 });
 
@@ -435,14 +551,35 @@ const seed = () => {
     gimmick:
       "Spirit Meter (0–100): builds 8 on hit, 4 on block. At 100, Yumi enters Azure Bloom — every special gains a follow-up and the Awakening unlocks. Spending 50% Spirit enables Phantom Step (i-frame dash-cancel) out of any grounded special on hit.",
   });
+  // Spirit Meter passive with a variable we can reference from variants
+  const spiritPassive = makePassive({
+    name: "Spirit Meter",
+    description:
+      "0–100 resource. Builds 8 on hit, 4 on block. Enables Phantom Step and unlocks the Azure Bloom awakening when full.",
+    variables: [
+      makePassiveVariable({
+        name: "Spirit",
+        kind: "number",
+        initial: "0",
+        description: "Current spirit charge (0–100).",
+      }),
+      makePassiveVariable({
+        name: "AzureBloom",
+        kind: "boolean",
+        initial: "false",
+        description: "True while the awakening buff is active.",
+      }),
+    ],
+  });
+  yumi.passives = [spiritPassive];
   yumi.moves.move1.name = "Crescent Slash";
   yumi.moves.move1.description = "A quick horizontal slash that opens combo strings.";
   const yv = yumi.moves.move1.variants[0];
   yv.classification = {
-    element: "None",
     status: "None",
     hitProperty: "Mid",
-    onHit: "Hitstun",
+    stunType: "Normal",
+    cutscene: "None",
   };
   yv.spec = {
     damage: "12",
@@ -461,6 +598,13 @@ const seed = () => {
       offsetZ: "-3.5",
     },
   };
+  // Wire up an example variable interaction: Crescent Slash builds Spirit on hit.
+  yv.variableInteractions = {
+    [spiritPassive.variables[0].id]: {
+      effect: "+8 on hit, +4 on block",
+      note: "Standard gauge build for a basic string opener.",
+    },
+  };
   yv.flavor =
     "Single flickering arc of moonlight. Camera whip-pans to a low side profile on impact. SFX: sharp steel-ring layered with a wind-cutting whoosh. VFX: cyan crescent trail dissolving into sakura petals.";
   yv.combo = "Cancels into: Move 2, Move 3, any Dash. Links into itself once.";
@@ -469,13 +613,17 @@ const seed = () => {
   yumi.moves.move2.description = "Forward lunge with i-frames mid-animation.";
   yumi.moves.move3.name = "Void Cutter";
   yumi.moves.move3.description = "Chargeable crescent projectile.";
+  yumi.moves.move3.variants[0] = makeVariant("Ground", "Attack", "Projectile");
   yumi.moves.move4.name = "Eclipse Rush";
   yumi.moves.move4.description = "Command grab cloaked in shadow.";
-  yumi.moves.move4.variants[0] = makeVariant("Ground", "Grab");
+  // Cinematic grab: use Attack/Special with cutscene=Cinematic to unlock
+  // the enemy + camera marker tracks.
+  yumi.moves.move4.variants[0] = makeVariant("Ground", "Attack", "Special");
   yumi.moves.move4.variants[0].classification = {
-    element: "Dark",
-    status: "Knockdown",
-    tech: "No",
+    status: "None",
+    hitProperty: "Unblockable",
+    stunType: "Downslam",
+    blockable: "No",
     cutscene: "Cinematic",
   };
   yumi.moves.utility.name = "Phantom Veil";
@@ -483,6 +631,16 @@ const seed = () => {
   yumi.moves.awakening.name = "Samsara · Final Moon";
   yumi.moves.awakening.description = "Cinematic finisher across three astral planes.";
   yumi.moves.awakening.finisherKind = "Ultimate";
+  // Awakening subtype already seeded by makeFinisher — add a sample submove
+  const awakeningVariant = yumi.moves.awakening.variants[0];
+  awakeningVariant.submoves = [
+    {
+      id: newId(),
+      name: "Lunar Rend",
+      description: "Azure-Bloom-only follow-up: a cross-cut that arcs twice.",
+      variants: [makeVariant("Ground", "Attack", "Special")],
+    },
+  ];
 
   const asahi = makeCharacter({
     name: "Asahi Tenma",
@@ -490,12 +648,27 @@ const seed = () => {
     gimmick:
       "Heat Stacks (0–5): each connected projectile adds a stack. At 3, projectiles ignite. At 5, gains a one-time free Awakening cast.",
   });
+  // Heat Stacks passive — demonstrates variables feeding variant interactions.
+  const heatPassive = makePassive({
+    name: "Heat Stacks",
+    description:
+      "Accumulates on connected projectiles. Thresholds modify subsequent specials.",
+    variables: [
+      makePassiveVariable({
+        name: "HeatStacks",
+        kind: "number",
+        initial: "0",
+        description: "0–5 stacks. Resets on whiff or death.",
+      }),
+    ],
+  });
+  asahi.passives = [heatPassive];
   asahi.moves.move1.name = "Ember Jab";
   asahi.moves.move2.name = "Cinder Wave";
-  asahi.moves.move2.variants[0] = makeVariant("Ground", "Projectile");
+  asahi.moves.move2.variants[0] = makeVariant("Ground", "Attack", "Projectile");
   asahi.moves.move3.name = "Solar Flare";
   asahi.moves.move4.name = "Kindle Counter";
-  asahi.moves.move4.variants[0] = makeVariant("Ground", "Counter");
+  asahi.moves.move4.variants[0] = makeVariant("Ground", "Defense", "Defense");
   asahi.enabledSlots = asahi.enabledSlots.filter((s) => s !== "utility");
   asahi.moves.awakening.name = "Phoenix Bloom";
   asahi.moves.awakening.finisherKind = "Awakening";
@@ -504,7 +677,9 @@ const seed = () => {
 };
 
 /* ===========================================================================
- * Luau export
+ * Luau export — serialize a character into a Roblox Studio module script
+ * with local Cooldowns / Damages / Endlag / Stuns tables and an Info table
+ * that references them. Mirrors the style used in hand-written movesets.
  * ======================================================================== */
 
 const LUA_RESERVED = new Set([
@@ -553,28 +728,81 @@ const hasHitboxData = (h) => {
   return !!(h.x || h.y || h.z || h.offsetX || h.offsetY || h.offsetZ);
 };
 
+/* Map classification field keys to the PascalCase names we emit in Luau.  */
 const CLASSIFICATION_EMIT = {
-  element: "Element",
   status: "Status",
   hitProperty: "HitProperty",
-  onHit: "OnHit",
-  behavior: "Behavior",
-  destructible: "Destructible",
+  stunType: "StunType",
   blockable: "Blockable",
-  tech: "Techable",
   cutscene: "Cutscene",
-  direction: "Direction",
+  target: "Target",
   iframes: "IFrames",
-  cancellable: "CancellableInto",
-  counters: "Counters",
-  outcome: "Outcome",
+  trigger: "Trigger",
   category: "Category",
   interruptible: "Interruptible",
-  scope: "Scope",
   stackable: "Stackable",
-  trigger: "Trigger",
-  effect: "FormEffect",
 };
+
+/* Map spec field keys to PascalCase names we emit in Luau. Covers both the
+ * base spec and the subtype-specific spec, so adding a new field to
+ * MOVE_TYPES.subtypeSpec is enough to make it round-trip into the export. */
+const SPEC_EMIT_NAME = {
+  // Base spec scalars (not routed through local tables)
+  knockback: "Knockback",
+  windup: "Windup",
+  speed: "Speed",
+  lifetime: "Lifetime",
+  range: "Range",
+  distance: "Distance",
+  iframeWindow: "IFrameWindow",
+  duration: "Duration",
+  effectDuration: "EffectDuration",
+  effect: "EffectMagnitude",
+  // Attack subtypes
+  reach: "Reach",
+  hitCount: "HitCount",
+  pushback: "Pushback",
+  trajectory: "Trajectory",
+  aimMode: "AimMode",
+  projectileCount: "ProjectileCount",
+  projectileSpeed: "ProjectileSpeed",
+  projectileLifetime: "ProjectileLifetime",
+  aoeRadius: "AoeRadius",
+  pierce: "Pierce",
+  chargeTime: "ChargeTime",
+  multiStage: "MultiStage",
+  // Defense subtypes
+  direction: "Direction",
+  iframeStart: "IFrameStart",
+  cancelWindow: "CancelWindow",
+  blockType: "BlockType",
+  coverage: "Coverage",
+  damageReduction: "DamageReduction",
+  parryWindow: "ParryWindow",
+  stat: "StatAffected",
+  magnitude: "Magnitude",
+  stacks: "MaxStacks",
+  targets: "Targets",
+  // Special subtypes
+  enterCondition: "EnterCondition",
+  exitCondition: "ExitCondition",
+  replacesMoves: "ReplacesMoves",
+  meterCost: "MeterCost",
+  threshold: "Threshold",
+  maxDuration: "MaxDuration",
+  replacesMoveset: "MovesetBehavior",
+  replacesMesh: "ReplacesMesh",
+  utilityKind: "UtilityKind",
+  chargeUses: "Charges",
+};
+
+/* Keys that are handled by special code paths above and must not be re-
+ * emitted by the generic spec walker. (Composite editors + local-table
+ * scalars + the hitbox structure.)                                         */
+const SPEC_HANDLED_KEYS = new Set([
+  "damage", "reactionDamage", "cooldown",
+  "stun", "endlag", "hitbox",
+]);
 
 const characterToLuau = (character) => {
   const slotMoves = DEFAULT_SLOTS.filter((s) =>
@@ -586,6 +814,29 @@ const characterToLuau = (character) => {
   const endlags = [];
   const stuns = [];
 
+  // Build a lookup map to resolve cross-references to human-readable labels.
+  const variantLabels = new Map(); // variant.id -> "Move name · Tag"
+  const moveLabels = new Map(); // slot.key -> "Slot: Move name"
+  for (const { slot, move } of slotMoves) {
+    moveLabels.set(slot.key, `${slot.label}: ${move.name || "Unnamed"}`);
+    for (const v of move.variants) {
+      variantLabels.set(
+        v.id,
+        `${move.name || slot.label} · ${v.tag} (${v.type}${v.subtype ? "/" + v.subtype : ""})`
+      );
+    }
+  }
+  const passiveLabels = new Map();
+  for (const p of character.passives || []) {
+    passiveLabels.set(p.id, p.name || "Unnamed Passive");
+  }
+  const passiveVarLookup = new Map(); // varId -> { passive, variable }
+  for (const p of character.passives || []) {
+    for (const v of p.variables) passiveVarLookup.set(v.id, { passive: p, variable: v });
+  }
+
+  // First pass: collect flat entries into the local tables (top-level only;
+  // sub-moveset variants go inline).
   for (const { slot, move } of slotMoves) {
     const moveKey = luaIdent(move.name || slot.label);
     for (const v of move.variants) {
@@ -610,6 +861,189 @@ const characterToLuau = (character) => {
 
   const lines = [];
   const push = (s = "") => lines.push(s);
+  const indent = (n) => "\t".repeat(n);
+  const subtypeFieldFor = (primary) =>
+    primary === "Defense"
+      ? "DefenseType"
+      : primary === "Special"
+      ? "SpecialType"
+      : "AttackType";
+
+  /* Emit a single variant body (everything inside the variant table). The
+   * `fullKey` is the local-table key (e.g. CrescentSlash_Ground) and `d`
+   * is the indentation depth in tabs. Used both for top-level variants
+   * (which reference local tables) and for inline submove variants
+   * (which inline their numbers).                                          */
+  const emitVariantBody = (v, fullKey, d, opts = {}) => {
+    const sp = v.spec || {};
+    const useLocals = !!fullKey && !opts.inline;
+    const I = indent(d);
+
+    // Type fields
+    push(`${I}MoveType = ${luaString(v.type || "Attack")},`);
+    if (v.subtype) {
+      push(`${I}${subtypeFieldFor(v.type || "Attack")} = ${luaString(v.subtype)},`);
+    }
+
+    // Classification — fields filtered by current MOVE_TYPES schema
+    const classFields = MOVE_TYPES[v.type || "Attack"]?.classification || [];
+    for (const field of classFields) {
+      const emitName = CLASSIFICATION_EMIT[field.key];
+      if (!emitName) continue;
+      const val = v.classification?.[field.key];
+      if (val && val !== "None") {
+        push(`${I}${emitName} = ${luaString(val)},`);
+      }
+    }
+
+    // References to local tables (top-level only — submoves go inline)
+    if (useLocals) {
+      if (sp.damage) push(`${I}Damage = Damages.${fullKey},`);
+      if (sp.reactionDamage) push(`${I}ReactionDamage = Damages.${fullKey},`);
+      if (hasStunData(sp.stun)) push(`${I}Stun = Stuns.${fullKey},`);
+      if (sp.cooldown) push(`${I}Cooldown = Cooldowns.${fullKey},`);
+      if (hasEndlagData(sp.endlag)) push(`${I}Endlag = Endlag.${fullKey},`);
+    } else {
+      // Submoves: inline scalar values directly so the parent variant is
+      // self-contained (no local-table indirection at nested scope).
+      if (sp.damage) push(`${I}Damage = ${luaNum(sp.damage)},`);
+      if (sp.reactionDamage) push(`${I}ReactionDamage = ${luaNum(sp.reactionDamage)},`);
+      if (sp.cooldown) push(`${I}Cooldown = ${luaNum(sp.cooldown)},`);
+      if (hasStunData(sp.stun)) {
+        push(`${I}Stun = { Duration = ${luaNum(sp.stun.duration)}, Priority = ${luaNum(sp.stun.priority, 1)} },`);
+      }
+      if (hasEndlagData(sp.endlag)) {
+        push(`${I}Endlag = { Success = ${luaNum(sp.endlag.success)}, Fail = ${luaNum(sp.endlag.fail)} },`);
+      }
+    }
+
+    // Inline numeric / string spec fields — walk both the base spec and
+    // the active subtype-specific spec so any new MOVE_TYPES field round-
+    // trips into the export. Pickers always emit as strings; everything
+    // else tries number first and falls back to a string.
+    {
+      const def = MOVE_TYPES[v.type || "Attack"];
+      const sub = v.subtype || def.subtypes[0];
+      const allFields = [
+        ...(def.spec || []),
+        ...((def.subtypeSpec && def.subtypeSpec[sub]) || []),
+      ];
+      const seen = new Set();
+      for (const field of allFields) {
+        if (seen.has(field.key)) continue;
+        seen.add(field.key);
+        if (SPEC_HANDLED_KEYS.has(field.key)) continue;
+        const emitName = SPEC_EMIT_NAME[field.key];
+        if (!emitName) continue;
+        const val = sp[field.key];
+        if (val == null || val === "") continue;
+        if (field.kind === "picker") {
+          push(`${I}${emitName} = ${luaString(val)},`);
+        } else {
+          const n = parseFloat(val);
+          if (Number.isFinite(n) && /^-?\d*\.?\d+%?$/.test(String(val).trim()) && !String(val).trim().endsWith("%")) {
+            push(`${I}${emitName} = ${n},`);
+          } else {
+            push(`${I}${emitName} = ${luaString(val)},`);
+          }
+        }
+      }
+    }
+
+    // Hitbox
+    if (hasHitboxData(sp.hitbox)) {
+      const h = sp.hitbox;
+      push(`${I}Hitbox = {`);
+      if (h.mode === "Radius") {
+        push(`${I}\tRadius = ${luaNum(h.radius)},`);
+      } else {
+        push(
+          `${I}\tSize = Vector3.new(${luaNum(h.x)}, ${luaNum(h.y)}, ${luaNum(h.z)}),`
+        );
+        if (h.offsetX || h.offsetY || h.offsetZ) {
+          push(
+            `${I}\tOffset = CFrame.new(${luaNum(h.offsetX)}, ${luaNum(h.offsetY)}, ${luaNum(h.offsetZ)}),`
+          );
+        }
+      }
+      push(`${I}},`);
+    }
+
+    // Variable interactions (bindings to passive variables)
+    const vi = v.variableInteractions || {};
+    const viIds = Object.keys(vi).filter((id) => passiveVarLookup.has(id));
+    if (viIds.length) {
+      push(`${I}VariableInteractions = {`);
+      for (const id of viIds) {
+        const { passive, variable } = passiveVarLookup.get(id);
+        const binding = vi[id] || {};
+        push(`${I}\t{`);
+        push(`${I}\t\tPassive = ${luaString(passive.name || "Unnamed Passive")},`);
+        push(`${I}\t\tVariable = ${luaString(variable.name || "unnamed")},`);
+        if (binding.effect) push(`${I}\t\tEffect = ${luaString(binding.effect)},`);
+        if (binding.note) push(`${I}\t\tNote = ${luaString(binding.note)},`);
+        push(`${I}\t},`);
+      }
+      push(`${I}},`);
+    }
+
+    // References (cross-links to other variants/moves/passives)
+    if (v.references && v.references.length) {
+      push(`${I}References = {`);
+      for (const r of v.references) {
+        push(`${I}\t{`);
+        push(`${I}\t\tKind = ${luaString(r.kind || "variant")},`);
+        const fresh =
+          r.kind === "passive"
+            ? passiveLabels.get(r.targetId)
+            : r.kind === "move"
+            ? moveLabels.get(r.targetId)
+            : variantLabels.get(r.targetId);
+        push(`${I}\t\tTarget = ${luaString(fresh || r.label || "(orphaned)")},`);
+        if (r.note) push(`${I}\t\tNote = ${luaString(r.note)},`);
+        push(`${I}\t},`);
+      }
+      push(`${I}},`);
+    }
+
+    // Markers
+    if (v.markers && v.markers.length) {
+      push(`${I}Markers = {`);
+      for (const m of v.markers) {
+        push(
+          `${I}\t{ Name = ${luaString(m.name)}, Time = ${luaNum(m.time)}, Track = ${luaString(m.track || "player")} },`
+        );
+      }
+      push(`${I}},`);
+    }
+
+    // Submoves (only meaningful for Awakening, but we just emit if present)
+    if (v.submoves && v.submoves.length) {
+      push(`${I}Submoves = {`);
+      for (const sm of v.submoves) {
+        const smKey = luaKey(sm.name || "Submove");
+        push(`${I}\t${smKey} = {`);
+        if (sm.description) {
+          push(`${I}\t\tDescription = ${luaString(sm.description)},`);
+        }
+        push(`${I}\t\tVariants = {`);
+        for (const sv of sm.variants) {
+          const svKey = luaIdent(sv.tag);
+          push(`${I}\t\t\t${svKey} = {`);
+          emitVariantBody(sv, null, d + 4, { inline: true });
+          push(`${I}\t\t\t},`);
+        }
+        push(`${I}\t\t},`);
+        push(`${I}\t},`);
+      }
+      push(`${I}},`);
+    }
+
+    // Flavor / combo / scaling (free-form strings — useful for dev notes)
+    if (v.flavor) push(`${I}Flavor = ${luaString(v.flavor)},`);
+    if (v.combo) push(`${I}Combo = ${luaString(v.combo)},`);
+    if (v.scaling) push(`${I}Scaling = ${luaString(v.scaling)},`);
+  };
 
   push(`-- ============================================================`);
   push(`-- ${character.name || "Character"} — Moveset Module`);
@@ -648,6 +1082,54 @@ const characterToLuau = (character) => {
   push(`}`);
   push();
 
+  // Mechanics (passives) live in their own local table. Each passive has
+  // its own variables dictionary so gameplay code can read/write them.
+  const passives = character.passives || [];
+  push(`local Mechanics = {`);
+  if (passives.length === 0) push(`\t-- (none)`);
+  for (const p of passives) {
+    const pKey = luaKey(p.name || "Passive");
+    push(`\t${pKey} = {`);
+    push(`\t\tName = ${luaString(p.name || "Unnamed Passive")},`);
+    if (p.description) push(`\t\tDescription = ${luaString(p.description)},`);
+    push(`\t\tVariables = {`);
+    for (const pv of p.variables) {
+      const vKey = luaKey(pv.name || "var");
+      const initialBlock =
+        pv.kind === "boolean"
+          ? `${(pv.initial || "").toLowerCase() === "true" ? "true" : "false"}`
+          : pv.kind === "number"
+          ? `${luaNum(pv.initial)}`
+          : luaString(pv.initial || "");
+      push(`\t\t\t${vKey} = {`);
+      push(`\t\t\t\tKind = ${luaString(pv.kind || "number")},`);
+      push(`\t\t\t\tInitial = ${initialBlock},`);
+      if (pv.description) push(`\t\t\t\tDescription = ${luaString(pv.description)},`);
+      push(`\t\t\t},`);
+    }
+    push(`\t\t},`);
+    if (p.references && p.references.length) {
+      push(`\t\tReferences = {`);
+      for (const r of p.references) {
+        const fresh =
+          r.kind === "passive"
+            ? passiveLabels.get(r.targetId)
+            : r.kind === "move"
+            ? moveLabels.get(r.targetId)
+            : variantLabels.get(r.targetId);
+        push(`\t\t\t{`);
+        push(`\t\t\t\tKind = ${luaString(r.kind || "variant")},`);
+        push(`\t\t\t\tTarget = ${luaString(fresh || r.label || "(orphaned)")},`);
+        if (r.note) push(`\t\t\t\tNote = ${luaString(r.note)},`);
+        push(`\t\t\t},`);
+      }
+      push(`\t\t},`);
+    }
+    push(`\t},`);
+  }
+  push(`}`);
+  push();
+
   push(`-- ============================================================`);
   push(`-- INFO MODULE (Moveset with all variants at equal scope)`);
   push(`-- ============================================================`);
@@ -661,6 +1143,7 @@ const characterToLuau = (character) => {
   push(`\tDamages = Damages,`);
   push(`\tEndlag = Endlag,`);
   push(`\tStuns = Stuns,`);
+  push(`\tMechanics = Mechanics,`);
   push();
   push(`\tMoveset = {`);
 
@@ -670,7 +1153,11 @@ const characterToLuau = (character) => {
 
     push(`\t\t${displayKey} = {`);
     const primaryType = move.variants[0]?.type || "Attack";
+    const primarySub = move.variants[0]?.subtype;
     push(`\t\t\tMoveType = ${luaString(primaryType)},`);
+    if (primarySub) {
+      push(`\t\t\t${subtypeFieldFor(primaryType)} = ${luaString(primarySub)},`);
+    }
     if (move.description) push(`\t\t\tDescription = ${luaString(move.description)},`);
     if (slot.isFinisher) push(`\t\t\tFinisherKind = ${luaString(move.finisherKind || "Awakening")},`);
     push(`\t\t\tSlot = ${luaString(slot.label)},`);
@@ -679,70 +1166,8 @@ const characterToLuau = (character) => {
     for (const v of move.variants) {
       const varKey = luaIdent(v.tag);
       const full = `${moveKey}_${varKey}`;
-      const sp = v.spec || {};
-
       push(`\t\t\t\t${varKey} = {`);
-
-      for (const [fieldKey, emitName] of Object.entries(CLASSIFICATION_EMIT)) {
-        const val = v.classification?.[fieldKey];
-        if (val && val !== "None") {
-          push(`\t\t\t\t\t${emitName} = ${luaString(val)},`);
-        }
-      }
-
-      if (sp.damage) push(`\t\t\t\t\tDamage = Damages.${full},`);
-      if (sp.reactionDamage) push(`\t\t\t\t\tReactionDamage = Damages.${full},`);
-      if (hasStunData(sp.stun)) push(`\t\t\t\t\tStun = Stuns.${full},`);
-      if (sp.cooldown) push(`\t\t\t\t\tCooldown = Cooldowns.${full},`);
-      if (hasEndlagData(sp.endlag)) push(`\t\t\t\t\tEndlag = Endlag.${full},`);
-
-      if (sp.knockback) push(`\t\t\t\t\tKnockback = ${luaNum(sp.knockback)},`);
-      if (sp.windup) push(`\t\t\t\t\tWindup = ${luaNum(sp.windup)},`);
-      if (sp.speed) push(`\t\t\t\t\tSpeed = ${luaNum(sp.speed)},`);
-      if (sp.lifetime) push(`\t\t\t\t\tLifetime = ${luaNum(sp.lifetime)},`);
-      if (sp.range) push(`\t\t\t\t\tRange = ${luaNum(sp.range)},`);
-      if (sp.distance) push(`\t\t\t\t\tDistance = ${luaNum(sp.distance)},`);
-      if (sp.iframeWindow) push(`\t\t\t\t\tIFrameWindow = ${luaNum(sp.iframeWindow)},`);
-      if (sp.grabRange) push(`\t\t\t\t\tGrabRange = ${luaNum(sp.grabRange)},`);
-      if (sp.cinematicLength) push(`\t\t\t\t\tCinematicLength = ${luaNum(sp.cinematicLength)},`);
-      if (sp.counterWindow) push(`\t\t\t\t\tCounterWindow = ${luaNum(sp.counterWindow)},`);
-      if (sp.duration) push(`\t\t\t\t\tDuration = ${luaNum(sp.duration)},`);
-      if (sp.effectDuration) push(`\t\t\t\t\tEffectDuration = ${luaNum(sp.effectDuration)},`);
-      if (sp.effect) push(`\t\t\t\t\tEffectMagnitude = ${luaString(sp.effect)},`);
-      if (sp.resourceCost) push(`\t\t\t\t\tResourceCost = ${luaString(sp.resourceCost)},`);
-
-      if (hasHitboxData(sp.hitbox)) {
-        const h = sp.hitbox;
-        push(`\t\t\t\t\tHitbox = {`);
-        if (h.mode === "Radius") {
-          push(`\t\t\t\t\t\tRadius = ${luaNum(h.radius)},`);
-        } else {
-          push(
-            `\t\t\t\t\t\tSize = Vector3.new(${luaNum(h.x)}, ${luaNum(h.y)}, ${luaNum(h.z)}),`
-          );
-          if (h.offsetX || h.offsetY || h.offsetZ) {
-            push(
-              `\t\t\t\t\t\tOffset = CFrame.new(${luaNum(h.offsetX)}, ${luaNum(h.offsetY)}, ${luaNum(h.offsetZ)}),`
-            );
-          }
-        }
-        push(`\t\t\t\t\t},`);
-      }
-
-      if (v.markers && v.markers.length) {
-        push(`\t\t\t\t\tMarkers = {`);
-        for (const m of v.markers) {
-          push(
-            `\t\t\t\t\t\t{ Name = ${luaString(m.name)}, Time = ${luaNum(m.time)}, Track = ${luaString(m.track || "player")} },`
-          );
-        }
-        push(`\t\t\t\t\t},`);
-      }
-
-      if (v.flavor) push(`\t\t\t\t\tFlavor = ${luaString(v.flavor)},`);
-      if (v.combo) push(`\t\t\t\t\tCombo = ${luaString(v.combo)},`);
-      if (v.scaling) push(`\t\t\t\t\tScaling = ${luaString(v.scaling)},`);
-
+      emitVariantBody(v, full, 5);
       push(`\t\t\t\t},`);
     }
 
@@ -765,13 +1190,30 @@ const characterToLuau = (character) => {
 };
 
 /* ===========================================================================
- * Theme
+ * Theme — neutral base + customizable accent color.
+ * The accent-dependent classes (accent, accentBg, accentRing, chipActive,
+ * danger, confirm) resolve to custom CSS classes whose rules use the
+ * `--accent` CSS variable injected at the App root. This lets the user
+ * recolor every red accent in the UI from a color picker.
  * ======================================================================== */
 
 const ACCENT_PRESETS = [
-  "#ef4444", "#f97316", "#f59e0b", "#eab308", "#84cc16", "#22c55e",
-  "#10b981", "#14b8a6", "#06b6d4", "#0ea5e9", "#3b82f6", "#6366f1",
-  "#8b5cf6", "#a855f7", "#d946ef", "#ec4899",
+  "#ef4444", // red (default)
+  "#f97316", // orange
+  "#f59e0b", // amber
+  "#eab308", // yellow
+  "#84cc16", // lime
+  "#22c55e", // green
+  "#10b981", // emerald
+  "#14b8a6", // teal
+  "#06b6d4", // cyan
+  "#0ea5e9", // sky
+  "#3b82f6", // blue
+  "#6366f1", // indigo
+  "#8b5cf6", // violet
+  "#a855f7", // purple
+  "#d946ef", // fuchsia
+  "#ec4899", // pink
 ];
 
 const DEFAULT_ACCENT = "#ef4444";
@@ -827,6 +1269,8 @@ const makeTheme = (dark) =>
         confirm: "accent-confirm",
       };
 
+/* Stylesheet for accent classes — injected once at App root. Uses
+ * color-mix() so tinted fills adjust automatically to any hex value. */
 const ACCENT_CSS = `
 .accent-text { color: var(--accent, ${DEFAULT_ACCENT}); }
 .accent-bg { background-color: color-mix(in srgb, var(--accent, ${DEFAULT_ACCENT}) 10%, transparent); }
@@ -887,29 +1331,61 @@ const Picker = ({ value, onChange, options, t, className = "" }) => (
 const Toggle = ({ title, icon: Icon, defaultOpen = true, t, children, meta, action }) => {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <section className={`border ${t.border} rounded-lg ${t.surface} overflow-hidden`}>
-      <div className={`w-full flex items-center gap-2 px-3 py-2.5 ${t.hover}`}>
+    <section
+      className={`border ${t.border} rounded-lg ${t.surface} overflow-hidden transition-colors`}
+    >
+      <div
+        className={`flex items-center gap-2 px-3 py-2 ${
+          open ? "" : t.surfaceAlt
+        } ${t.hover}`}
+      >
         <button
           onClick={() => setOpen((v) => !v)}
-          className="flex items-center gap-2 flex-1 text-left"
+          className="flex items-center gap-2.5 flex-1 text-left min-w-0"
         >
-          {open ? (
-            <ChevronDown size={16} className={t.sub} />
-          ) : (
-            <ChevronRight size={16} className={t.sub} />
+          <ChevronRight
+            size={14}
+            className={`${t.sub} shrink-0 transition-transform duration-150 ${
+              open ? "rotate-90" : ""
+            }`}
+          />
+          {Icon && (
+            <Icon
+              size={14}
+              className={`shrink-0 transition-colors ${
+                open ? t.accent : t.sub
+              }`}
+            />
           )}
-          {Icon && <Icon size={15} className={t.sub} />}
-          <span className="font-medium text-sm">{title}</span>
-          {meta && <span className={`ml-2 text-xs ${t.faint}`}>{meta}</span>}
+          <span className="font-medium text-[13px] tracking-tight truncate">
+            {title}
+          </span>
+          {meta && (
+            <span className={`text-[11px] ${t.faint} truncate`}>· {meta}</span>
+          )}
         </button>
         {action}
       </div>
       {open && (
-        <div className={`px-4 pb-4 pt-1 border-t ${t.subBorder}`}>{children}</div>
+        <div className={`px-4 pb-4 pt-3 border-t ${t.subBorder}`}>{children}</div>
       )}
     </section>
   );
 };
+
+/* SectionGroup — a small typographic divider that labels a cluster of
+ * related Toggle sections. Used inside the variant editor to give the long
+ * scroll some structure without forcing collapsible nesting.            */
+const SectionGroup = ({ label, t }) => (
+  <div
+    className={`flex items-center gap-3 pt-3 pb-1 px-1 select-none ${t.faint}`}
+  >
+    <span className="text-[10px] uppercase tracking-[0.18em] font-medium">
+      {label}
+    </span>
+    <span className={`flex-1 h-px ${t.divider}`} />
+  </div>
+);
 
 const IconBtn = ({ children, onClick, t, title, className = "", danger = false }) => (
   <button
@@ -923,6 +1399,8 @@ const IconBtn = ({ children, onClick, t, title, className = "", danger = false }
   </button>
 );
 
+/* Two-click delete — replaces window.confirm() (which is blocked in
+ * sandboxed iframes, the reason the previous delete buttons were silent). */
 const ConfirmDelete = ({ onConfirm, t, title = "Delete", icon: Icon = Trash2, size = 12, className = "" }) => {
   const [armed, setArmed] = useState(false);
   const timeoutRef = useRef(null);
@@ -971,47 +1449,8 @@ const ConfirmDelete = ({ onConfirm, t, title = "Delete", icon: Icon = Trash2, si
 };
 
 /* ===========================================================================
- * Sync Status Indicator
- * ======================================================================== */
-
-const SyncIndicator = ({ status, t }) => {
-  if (status === "loading" || status === "saving") {
-    return (
-      <span className={`flex items-center gap-1.5 text-[11px] ${t.faint}`}>
-        <Loader2 size={11} className="animate-spin" />
-        {status === "loading" ? "Loading…" : "Saving…"}
-      </span>
-    );
-  }
-  if (status === "saved") {
-    return (
-      <span className="flex items-center gap-1.5 text-[11px] text-green-500">
-        <Check size={11} />
-        Saved
-      </span>
-    );
-  }
-  if (status === "error") {
-    return (
-      <span className="flex items-center gap-1.5 text-[11px] text-red-500">
-        <AlertCircle size={11} />
-        Save failed
-      </span>
-    );
-  }
-  if (status === "pending") {
-    return (
-      <span className={`flex items-center gap-1.5 text-[11px] ${t.faint}`}>
-        <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
-        Unsaved
-      </span>
-    );
-  }
-  return <span className={`text-[11px] ${t.faint}`}>All saved</span>;
-};
-
-/* ===========================================================================
- * Media
+ * Media — supports YouTube/Streamable embeds, direct video/image/audio
+ * URLs, and local file uploads (via blob URLs).
  * ======================================================================== */
 
 const youtubeId = (url) => {
@@ -1320,40 +1759,55 @@ const MediaGallery = ({ variant, updateVariant, t }) => {
   );
 };
 
+
 /* ===========================================================================
  * Type-driven Classification + Spec
  * ======================================================================== */
 
 const TypePicker = ({ variant, updateVariant, t }) => {
-  const TypeIcon = MOVE_TYPES[variant.type].icon;
+  const def = MOVE_TYPES[variant.type];
+  const PrimaryIcon = def.icon;
+  const SubIcon = SUBTYPE_ICON[variant.subtype] || PrimaryIcon;
+
+  const changePrimary = (newType) => {
+    if (newType === variant.type) return;
+    const newDef = MOVE_TYPES[newType];
+    const newSub = newDef.subtypes[0];
+    const usingDefaults = variant.markers.every((m) =>
+      MOVE_TYPES[variant.type].defaultMarkers.some(
+        (d) => d.name === m.name && d.time === m.time && d.track === m.track
+      )
+    );
+    updateVariant({
+      ...variant,
+      type: newType,
+      subtype: newSub,
+      // Wipe classification — schema fields change wholesale between primaries
+      classification: {},
+      markers: usingDefaults ? seedMarkersForType(newType) : variant.markers,
+    });
+  };
+
+  const changeSubtype = (newSub) => {
+    updateVariant({ ...variant, subtype: newSub });
+  };
+
   return (
     <div className={`rounded-xl border ${t.border} ${t.surface} p-4 ${t.accentRing}`}>
       <div className="flex items-center gap-3">
         <div
           className={`w-10 h-10 rounded-lg flex items-center justify-center ${t.accentBg} ${t.accent}`}
         >
-          <TypeIcon size={18} />
+          <PrimaryIcon size={18} />
         </div>
         <div className="flex-1 min-w-0">
           <div className={`text-[11px] uppercase tracking-wider ${t.faint}`}>
             Move Type · sets the rest of this card's structure
           </div>
-          <div className="flex items-center gap-2 mt-0.5">
+          <div className="flex items-center gap-2 mt-0.5 flex-wrap">
             <select
               value={variant.type}
-              onChange={(e) => {
-                const newType = e.target.value;
-                const usingDefaults = variant.markers.every((m) =>
-                  MOVE_TYPES[variant.type].defaultMarkers.some(
-                    (d) => d.name === m.name && d.time === m.time && d.track === m.track
-                  )
-                );
-                updateVariant({
-                  ...variant,
-                  type: newType,
-                  markers: usingDefaults ? seedMarkersForType(newType) : variant.markers,
-                });
-              }}
+              onChange={(e) => changePrimary(e.target.value)}
               className={`text-lg font-semibold bg-transparent outline-none ${t.text}`}
             >
               {MOVE_TYPE_KEYS.map((k) => (
@@ -1363,9 +1817,22 @@ const TypePicker = ({ variant, updateVariant, t }) => {
               ))}
             </select>
             <ChevronsUpDown size={14} className={t.faint} />
+            <span className={`${t.faint} mx-1`}>·</span>
+            <SubIcon size={13} className={t.accent} />
+            <select
+              value={variant.subtype || def.subtypes[0]}
+              onChange={(e) => changeSubtype(e.target.value)}
+              className={`text-sm font-medium bg-transparent outline-none ${t.text}`}
+            >
+              {def.subtypes.map((s) => (
+                <option key={s} value={s} className={t.inputBg}>
+                  {s}
+                </option>
+              ))}
+            </select>
           </div>
           <div className={`text-xs ${t.sub} mt-1`}>
-            {MOVE_TYPES[variant.type].blurb}
+            {def.blurb}
           </div>
         </div>
       </div>
@@ -1376,7 +1843,12 @@ const TypePicker = ({ variant, updateVariant, t }) => {
 const ClassificationSection = ({ variant, updateVariant, t }) => {
   const def = MOVE_TYPES[variant.type];
   return (
-    <Toggle title="Classification" icon={Target} t={t} meta={variant.type}>
+    <Toggle
+      title="Classification"
+      icon={Target}
+      t={t}
+      meta={`${variant.type} · ${variant.subtype || def.subtypes[0]}`}
+    >
       <div className={`rounded-lg border ${t.border} overflow-hidden`}>
         <table className="w-full text-sm">
           <tbody>
@@ -1420,6 +1892,9 @@ const ClassificationSection = ({ variant, updateVariant, t }) => {
     </Toggle>
   );
 };
+
+/* Composite spec-field editors — each is a fragment that writes back into
+ * the owning variant's `spec[field.key]` object. */
 
 const StunSpecEditor = ({ value, onChange, t }) => {
   const v = value && typeof value === "object" ? value : {};
@@ -1554,6 +2029,8 @@ const HitboxSpecEditor = ({ value, onChange, t }) => {
 
 const SpecSheet = ({ variant, updateVariant, t }) => {
   const def = MOVE_TYPES[variant.type];
+  const sub = variant.subtype || def.subtypes[0];
+  const subtypeFields = (def.subtypeSpec && def.subtypeSpec[sub]) || [];
 
   const setSpec = (key, v) =>
     updateVariant({
@@ -1589,6 +2066,17 @@ const SpecSheet = ({ variant, updateVariant, t }) => {
         />
       );
     }
+    if (field.kind === "picker") {
+      return (
+        <Picker
+          value={variant.spec[field.key] ?? field.options[0]}
+          onChange={(v) => setSpec(field.key, v)}
+          options={field.options}
+          t={t}
+          className="text-sm w-full"
+        />
+      );
+    }
     return (
       <Field
         value={variant.spec[field.key]}
@@ -1600,31 +2088,54 @@ const SpecSheet = ({ variant, updateVariant, t }) => {
     );
   };
 
+  const renderRow = (field, isLast) => {
+    const isComposite = field.kind === "stun" || field.kind === "endlag" || field.kind === "hitbox";
+    return (
+      <tr
+        key={field.key}
+        className={!isLast ? `border-b ${t.subBorder}` : ""}
+      >
+        <td
+          className={`w-1/3 px-3 py-2 ${t.sub} text-xs uppercase tracking-wider align-top`}
+        >
+          {field.label}
+        </td>
+        <td className={isComposite ? "py-1" : "px-2 py-1"}>
+          {renderCell(field)}
+        </td>
+      </tr>
+    );
+  };
+
   return (
-    <Toggle title="Spec Sheet" icon={Gauge} t={t} meta={variant.type}>
+    <Toggle
+      title="Spec Sheet"
+      icon={Gauge}
+      t={t}
+      meta={`${variant.type} · ${sub}`}
+    >
       <div className={`rounded-lg border ${t.border} overflow-hidden`}>
         <table className="w-full text-sm">
           <tbody>
-            {def.spec.map((field, i) => {
-              const isComposite = !!field.kind;
-              return (
-                <tr
-                  key={field.key}
-                  className={
-                    i !== def.spec.length - 1 ? `border-b ${t.subBorder}` : ""
-                  }
+            {def.spec.map((field, i) =>
+              renderRow(
+                field,
+                i === def.spec.length - 1 && subtypeFields.length === 0
+              )
+            )}
+            {subtypeFields.length > 0 && (
+              <tr className={`border-t ${t.subBorder} ${t.surfaceAlt}`}>
+                <td
+                  colSpan={2}
+                  className={`px-3 py-1.5 ${t.sub} text-[10px] uppercase tracking-widest`}
                 >
-                  <td
-                    className={`w-1/3 px-3 py-2 ${t.sub} text-xs uppercase tracking-wider align-top`}
-                  >
-                    {field.label}
-                  </td>
-                  <td className={isComposite ? "py-1" : "px-2 py-1"}>
-                    {renderCell(field)}
-                  </td>
-                </tr>
-              );
-            })}
+                  Subtype-specific · {sub}
+                </td>
+              </tr>
+            )}
+            {subtypeFields.map((field, i) =>
+              renderRow(field, i === subtypeFields.length - 1)
+            )}
           </tbody>
         </table>
       </div>
@@ -1744,6 +2255,7 @@ const MarkerTrackTable = ({ variant, updateVariant, track, t }) => {
 
 const KeyframeMarkers = ({ variant, updateVariant, t }) => {
   const tracks = tracksFor(variant);
+  const isCinematic = tracks.length > 1;
 
   const resetToDefaults = () =>
     updateVariant({
@@ -1759,7 +2271,7 @@ const KeyframeMarkers = ({ variant, updateVariant, t }) => {
       icon={Clock}
       t={t}
       meta={
-        variant.type === "Grab"
+        isCinematic
           ? `${tracks.length} track${tracks.length === 1 ? "" : "s"} · ${variant.markers.length} markers`
           : `${variant.markers.length} markers`
       }
@@ -1772,13 +2284,14 @@ const KeyframeMarkers = ({ variant, updateVariant, t }) => {
       <div className={`text-[11px] ${t.faint} mb-3`}>
         Roblox-style: name and time (seconds) of each <code>KeyframeMarker</code>{" "}
         the animation script should listen for.
-        {variant.type === "Grab" && (
+        {isCinematic && (
           <>
             {" "}
-            Grabs use separate tracks for the player and victim animations
+            Cinematic interactions use separate tracks for the player and victim
+            animations
             {tracks.includes("camera")
               ? " — and a camera track since Cutscene Style is set to Cinematic."
-              : " — switch Cutscene Style to Cinematic to add a camera track."}
+              : "."}
           </>
         )}
       </div>
@@ -1836,6 +2349,526 @@ const ScalingLogic = ({ variant, updateVariant, t }) => (
 );
 
 /* ===========================================================================
+ * Variable Interactions — spec-sheet section that lets this variant bind
+ * to / react to variables declared by the character's passives. Each
+ * binding is keyed by passive-variable-id and stores a free-form "effect"
+ * description plus an optional note.
+ * ======================================================================== */
+
+const VariableInteractionsSection = ({ variant, updateVariant, character, t }) => {
+  const passives = character.passives || [];
+  const allVars = passives.flatMap((p) =>
+    p.variables.map((v) => ({ ...v, passiveId: p.id, passiveName: p.name || "Passive" }))
+  );
+  const interactions = variant.variableInteractions || {};
+
+  const setInteraction = (varId, patch) =>
+    updateVariant({
+      ...variant,
+      variableInteractions: {
+        ...interactions,
+        [varId]: { ...(interactions[varId] || {}), ...patch },
+      },
+    });
+
+  const removeInteraction = (varId) => {
+    const next = { ...interactions };
+    delete next[varId];
+    updateVariant({ ...variant, variableInteractions: next });
+  };
+
+  const boundIds = Object.keys(interactions);
+  const unboundVars = allVars.filter((v) => !interactions[v.id]);
+
+  return (
+    <Toggle
+      title="Variable Interactions"
+      icon={Gauge}
+      t={t}
+      meta={`${boundIds.length} bound · ${allVars.length} available`}
+    >
+      {allVars.length === 0 ? (
+        <div className={`text-[11px] ${t.faint} italic`}>
+          Add passive variables up in the character header to wire them into
+          this variant (e.g. "+8 Spirit on hit", "consumes 2 Heat Stacks").
+        </div>
+      ) : (
+        <>
+          {boundIds.length === 0 && (
+            <div className={`text-[11px] ${t.faint} mb-2`}>
+              Bind this variant to any passive variable to describe how it
+              reads or writes that variable.
+            </div>
+          )}
+
+          {boundIds.length > 0 && (
+            <div className={`rounded-lg border ${t.border} overflow-hidden mb-3`}>
+              <table className="w-full text-sm">
+                <tbody>
+                  {boundIds.map((id, i) => {
+                    const v = allVars.find((x) => x.id === id);
+                    const binding = interactions[id];
+                    if (!v) {
+                      // Dangling reference — variable was deleted. Offer cleanup.
+                      return (
+                        <tr key={id} className={i !== 0 ? `border-t ${t.subBorder}` : ""}>
+                          <td className="px-3 py-2 text-xs">
+                            <span className={`${t.danger} italic`}>
+                              (variable deleted)
+                            </span>
+                          </td>
+                          <td className="px-2 py-1">
+                            <span className={`text-xs ${t.faint} italic`}>
+                              {binding?.effect || ""}
+                            </span>
+                          </td>
+                          <td className="w-10 px-1">
+                            <ConfirmDelete
+                              onConfirm={() => removeInteraction(id)}
+                              t={t}
+                              icon={X}
+                              size={12}
+                            />
+                          </td>
+                        </tr>
+                      );
+                    }
+                    return (
+                      <tr
+                        key={id}
+                        className={i !== 0 ? `border-t ${t.subBorder}` : ""}
+                      >
+                        <td className="px-3 py-2 w-1/3 align-top">
+                          <div className={`text-sm font-mono ${t.accent}`}>
+                            {v.name || "unnamed"}
+                          </div>
+                          <div className={`text-[10px] uppercase tracking-wider ${t.faint}`}>
+                            {v.passiveName} · {v.kind}
+                          </div>
+                        </td>
+                        <td className="px-2 py-1">
+                          <Field
+                            value={binding.effect}
+                            onChange={(x) => setInteraction(id, { effect: x })}
+                            placeholder="+8 on hit / −2 on use / reads current value"
+                            t={t}
+                            className="text-sm"
+                          />
+                          <Field
+                            value={binding.note}
+                            onChange={(x) => setInteraction(id, { note: x })}
+                            placeholder="Notes / conditions"
+                            t={t}
+                            className={`text-xs ${t.sub}`}
+                          />
+                        </td>
+                        <td className="w-10 px-1 align-top">
+                          <ConfirmDelete
+                            onConfirm={() => removeInteraction(id)}
+                            t={t}
+                            icon={X}
+                            size={12}
+                          />
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {unboundVars.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              <span className={`text-[11px] ${t.faint} self-center mr-1`}>
+                Bind:
+              </span>
+              {unboundVars.map((v) => (
+                <button
+                  key={v.id}
+                  onClick={() =>
+                    setInteraction(v.id, { effect: "", note: "" })
+                  }
+                  className={`text-[11px] px-2 py-1 rounded-full border ${t.chipIdle} inline-flex items-center gap-1`}
+                  title={`${v.passiveName} · ${v.kind}`}
+                >
+                  <Plus size={10} /> {v.name || "unnamed"}
+                  <span className={`${t.faint}`}>· {v.passiveName}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </Toggle>
+  );
+};
+
+/* ===========================================================================
+ * References — cross-link this variant/move/passive to others on the same
+ * character. Handy for describing combo routes, awakening-only follow-ups,
+ * or passive interactions without duplicating the underlying data.
+ * ======================================================================== */
+
+const buildReferenceCatalog = (character, excludeVariantId) => {
+  const out = [];
+  DEFAULT_SLOTS.filter((s) => character.enabledSlots.includes(s.key)).forEach(
+    (slot) => {
+      const move = character.moves[slot.key];
+      if (!move) return;
+      out.push({
+        id: `move:${slot.key}`,
+        kind: "move",
+        label: `${slot.label}: ${move.name || "Untitled"}`,
+        targetId: slot.key,
+      });
+      move.variants.forEach((v) => {
+        if (v.id === excludeVariantId) return;
+        out.push({
+          id: `variant:${v.id}`,
+          kind: "variant",
+          label: `${move.name || slot.label} · ${v.tag} (${v.type}${v.subtype ? "/" + v.subtype : ""})`,
+          targetId: v.id,
+          parentMoveKey: slot.key,
+        });
+      });
+    }
+  );
+  (character.passives || []).forEach((p) => {
+    out.push({
+      id: `passive:${p.id}`,
+      kind: "passive",
+      label: `Passive: ${p.name || "Unnamed"}`,
+      targetId: p.id,
+    });
+  });
+  return out;
+};
+
+const REFERENCE_KIND_META = {
+  variant: { label: "Variant", Icon: Layers },
+  move: { label: "Move", Icon: Swords },
+  passive: { label: "Passive", Icon: Star },
+};
+
+const ReferencesSection = ({
+  owner,
+  references,
+  updateReferences,
+  character,
+  t,
+  title = "References",
+  excludeVariantId,
+}) => {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const catalog = buildReferenceCatalog(character, excludeVariantId);
+  const existingIds = new Set(references.map((r) => r.id));
+  const available = catalog.filter((c) => !existingIds.has(c.id));
+
+  const addRef = (entry) => {
+    updateReferences([
+      ...references,
+      {
+        id: entry.id,
+        kind: entry.kind,
+        targetId: entry.targetId,
+        parentMoveKey: entry.parentMoveKey,
+        label: entry.label,
+        note: "",
+      },
+    ]);
+    setPickerOpen(false);
+  };
+
+  const patchRef = (id, patch) => {
+    updateReferences(
+      references.map((r) => (r.id === id ? { ...r, ...patch } : r))
+    );
+  };
+
+  const removeRef = (id) =>
+    updateReferences(references.filter((r) => r.id !== id));
+
+  return (
+    <Toggle
+      title={title}
+      icon={GitBranch}
+      t={t}
+      meta={`${references.length} ref${references.length === 1 ? "" : "s"}`}
+      action={
+        <div className="relative">
+          <IconBtn
+            t={t}
+            onClick={(e) => {
+              e?.stopPropagation?.();
+              setPickerOpen((v) => !v);
+            }}
+            title="Add reference"
+          >
+            <Plus size={12} /> Mention
+          </IconBtn>
+          {pickerOpen && (
+            <div
+              className={`absolute right-0 top-full mt-1 z-30 min-w-[260px] max-h-64 overflow-y-auto rounded-lg border ${t.border} ${t.surface} shadow-lg py-1`}
+              onClick={(e) => e.stopPropagation()}
+            >
+              {available.length === 0 ? (
+                <div className={`px-3 py-2 text-[11px] ${t.faint}`}>
+                  Nothing left to reference — already linked to everything.
+                </div>
+              ) : (
+                available.map((entry) => {
+                  const Meta = REFERENCE_KIND_META[entry.kind];
+                  return (
+                    <button
+                      key={entry.id}
+                      onClick={() => addRef(entry)}
+                      className={`w-full text-left px-3 py-1.5 text-xs ${t.hover} flex items-center gap-2`}
+                    >
+                      <Meta.Icon size={11} className={t.accent} />
+                      <span className="flex-1 truncate">{entry.label}</span>
+                      <span className={`text-[10px] ${t.faint} uppercase`}>
+                        {Meta.label}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          )}
+        </div>
+      }
+    >
+      {references.length === 0 ? (
+        <div className={`text-[11px] ${t.faint} italic`}>
+          Use Mention to cross-reference other variants, moves, or passives on
+          this character. References are plain pointers — describe each link in
+          the note field.
+        </div>
+      ) : (
+        <div className={`rounded-lg border ${t.border} overflow-hidden`}>
+          <table className="w-full text-sm">
+            <tbody>
+              {references.map((r, i) => {
+                const Meta = REFERENCE_KIND_META[r.kind] || REFERENCE_KIND_META.variant;
+                // Re-derive a fresh label in case the target was renamed
+                const fresh = catalog.find((c) => c.id === r.id);
+                const label = fresh?.label || r.label || "(orphaned reference)";
+                return (
+                  <tr key={r.id} className={i !== 0 ? `border-t ${t.subBorder}` : ""}>
+                    <td className="px-3 py-2 w-1/3 align-top">
+                      <div className={`text-xs font-medium flex items-center gap-1.5 ${fresh ? "" : t.danger}`}>
+                        <Meta.Icon size={11} className={fresh ? t.accent : ""} />
+                        <span className="truncate">{label}</span>
+                      </div>
+                      <div className={`text-[10px] uppercase tracking-wider ${t.faint} mt-0.5`}>
+                        {Meta.label}
+                        {!fresh ? " · orphaned" : ""}
+                      </div>
+                    </td>
+                    <td className="px-2 py-1">
+                      <Field
+                        value={r.note}
+                        onChange={(v) => patchRef(r.id, { note: v })}
+                        placeholder="How does this relate to the current element?"
+                        t={t}
+                        className={`text-xs ${t.sub}`}
+                      />
+                    </td>
+                    <td className="w-10 px-1 align-top">
+                      <ConfirmDelete
+                        onConfirm={() => removeRef(r.id)}
+                        t={t}
+                        icon={X}
+                        size={12}
+                      />
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Toggle>
+  );
+};
+
+/* ===========================================================================
+ * Sub-Moveset (Awakening only) — a nested moveset authored entirely inside
+ * an Awakening variant. Each submove is a shallow {name, description,
+ * variants[]} object; each variant is a full Variant so it gets spec sheet,
+ * markers, media, etc.
+ * ======================================================================== */
+
+const SubVariantEditor = ({ subvariant, updateSubvariant, removeSubvariant, character, t }) => {
+  const def = MOVE_TYPES[subvariant.type];
+  return (
+    <div className={`rounded-lg border ${t.border} ${t.soft} p-3 space-y-3`}>
+      <div className="flex items-center gap-2">
+        <Layers size={12} className={t.accent} />
+        <select
+          value={subvariant.tag}
+          onChange={(e) => updateSubvariant({ ...subvariant, tag: e.target.value })}
+          className={`text-xs bg-transparent outline-none rounded px-1.5 py-0.5 border ${t.border} ${t.inputBg}`}
+        >
+          {[...new Set([...VARIANT_TAGS, subvariant.tag])].map((tg) => (
+            <option key={tg} value={tg}>
+              {tg}
+            </option>
+          ))}
+        </select>
+        <select
+          value={subvariant.type}
+          onChange={(e) => {
+            const newType = e.target.value;
+            updateSubvariant({
+              ...subvariant,
+              type: newType,
+              subtype: MOVE_TYPES[newType].subtypes[0],
+              classification: {},
+            });
+          }}
+          className={`text-xs bg-transparent outline-none rounded px-1.5 py-0.5 border ${t.border} ${t.inputBg}`}
+        >
+          {MOVE_TYPE_KEYS.map((k) => (
+            <option key={k} value={k}>
+              {k}
+            </option>
+          ))}
+        </select>
+        <select
+          value={subvariant.subtype || def.subtypes[0]}
+          onChange={(e) => updateSubvariant({ ...subvariant, subtype: e.target.value })}
+          className={`text-xs bg-transparent outline-none rounded px-1.5 py-0.5 border ${t.border} ${t.inputBg}`}
+        >
+          {def.subtypes.map((s) => (
+            <option key={s} value={s}>
+              {s}
+            </option>
+          ))}
+        </select>
+        <div className="ml-auto">
+          <ConfirmDelete onConfirm={removeSubvariant} t={t} title="Remove sub-variant" />
+        </div>
+      </div>
+
+      <SpecSheet variant={subvariant} updateVariant={updateSubvariant} t={t} />
+    </div>
+  );
+};
+
+const SubMoveCard = ({ submove, updateSubmove, removeSubmove, character, t }) => {
+  const setVariants = (variants) => updateSubmove({ ...submove, variants });
+  const updateSubvariant = (updated) =>
+    setVariants(submove.variants.map((v) => (v.id === updated.id ? updated : v)));
+
+  return (
+    <div className={`rounded-xl border ${t.border} ${t.surface} p-3 space-y-3`}>
+      <div className="flex items-center gap-2">
+        <Flame size={14} className={t.accent} />
+        <input
+          value={submove.name}
+          onChange={(e) => updateSubmove({ ...submove, name: e.target.value })}
+          placeholder="Sub-move name"
+          className={`flex-1 bg-transparent outline-none text-base font-semibold tracking-tight rounded px-1 ${t.hover}`}
+        />
+        <ConfirmDelete onConfirm={removeSubmove} t={t} title="Remove sub-move" />
+      </div>
+      <Area
+        value={submove.description}
+        onChange={(v) => updateSubmove({ ...submove, description: v })}
+        placeholder="What this sub-move does while awakened."
+        rows={2}
+        t={t}
+        className={`text-xs ${t.sub}`}
+      />
+
+      <div className="space-y-2">
+        {submove.variants.map((sv) => (
+          <SubVariantEditor
+            key={sv.id}
+            subvariant={sv}
+            updateSubvariant={updateSubvariant}
+            removeSubvariant={() => {
+              if (submove.variants.length <= 1) return;
+              setVariants(submove.variants.filter((v) => v.id !== sv.id));
+            }}
+            character={character}
+            t={t}
+          />
+        ))}
+        <button
+          onClick={() => setVariants([...submove.variants, makeVariant("Ground", "Attack", "Special")])}
+          className={`w-full text-[11px] px-2 py-1.5 rounded border border-dashed ${t.border} ${t.hover} ${t.sub} inline-flex items-center justify-center gap-1`}
+        >
+          <Plus size={11} /> Add sub-variant
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const SubMovesetSection = ({ variant, updateVariant, character, t }) => {
+  const submoves = variant.submoves || [];
+  const setSubmoves = (next) => updateVariant({ ...variant, submoves: next });
+
+  return (
+    <Toggle
+      title="Awakening Sub-Moveset"
+      icon={Flame}
+      t={t}
+      meta={`${submoves.length} sub-move${submoves.length === 1 ? "" : "s"}`}
+      action={
+        <IconBtn
+          t={t}
+          onClick={() =>
+            setSubmoves([
+              ...submoves,
+              {
+                id: newId(),
+                name: "New sub-move",
+                description: "",
+                variants: [makeVariant("Ground", "Attack", "Special")],
+              },
+            ])
+          }
+          title="Add sub-move"
+        >
+          <Plus size={12} /> Sub-move
+        </IconBtn>
+      }
+    >
+      {submoves.length === 0 ? (
+        <div
+          className={`rounded-lg border border-dashed ${t.border} ${t.soft} py-6 text-center ${t.faint} text-xs`}
+        >
+          Awakenings can unlock a nested moveset. Add sub-moves here to
+          document the alternate kit available during this transformation.
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {submoves.map((sm) => (
+            <SubMoveCard
+              key={sm.id}
+              submove={sm}
+              updateSubmove={(updated) =>
+                setSubmoves(submoves.map((x) => (x.id === updated.id ? updated : x)))
+              }
+              removeSubmove={() =>
+                setSubmoves(submoves.filter((x) => x.id !== sm.id))
+              }
+              character={character}
+              t={t}
+            />
+          ))}
+        </div>
+      )}
+    </Toggle>
+  );
+};
+
+/* ===========================================================================
  * Sidebar — Roster + Move Tree
  * ======================================================================== */
 
@@ -1874,6 +2907,7 @@ const RosterSection = ({
               isActive ? `${t.accentBg} ${t.accentRing}` : t.surface
             }`}
           >
+            {/* Always-visible header row: chevron + anime title + delete */}
             <div className="flex items-center gap-1 px-1.5 py-1">
               <button
                 onClick={() => toggleMinimize(c.id)}
@@ -1904,6 +2938,7 @@ const RosterSection = ({
               />
             </div>
 
+            {/* Body — hidden when minimized */}
             {!isMin && (
               <button
                 onClick={() => selectCharacter(c.id)}
@@ -1964,7 +2999,12 @@ const AddVariantInline = ({ move, onAdd, t }) => {
             <button
               key={tag}
               onClick={() => {
-                onAdd(tag, move.variants[0]?.type || "Attack");
+                const base = move.variants[0];
+                onAdd(
+                  tag,
+                  base?.type || "Attack",
+                  base?.subtype || null
+                );
                 setOpen(false);
               }}
               className={`w-full text-left px-2 py-1 text-xs ${t.hover}`}
@@ -2028,7 +3068,7 @@ const MoveTree = ({
             ? move.finisherKind === "Ultimate"
               ? Star
               : Sparkles
-            : MOVE_TYPES[move.variants[0]?.type || "Attack"].icon;
+            : iconForVariant(move.variants[0]);
 
           return (
             <div key={slot.key}>
@@ -2097,7 +3137,7 @@ const MoveTree = ({
                     const isActiveVariant =
                       activeMoveKey === slot.key &&
                       activeVariantId === v.id;
-                    const VIcon = MOVE_TYPES[v.type].icon;
+                    const VIcon = iconForVariant(v);
                     return (
                       <div
                         key={v.id}
@@ -2123,7 +3163,7 @@ const MoveTree = ({
                           </div>
                           <div className={`text-[10px] ${t.faint} flex items-center gap-1`}>
                             <VIcon size={9} />
-                            {v.type}
+                            {v.subtype ? `${v.type} · ${v.subtype}` : v.type}
                           </div>
                         </div>
                         {move.variants.length > 1 && (
@@ -2157,8 +3197,8 @@ const MoveTree = ({
                   })}
                   <AddVariantInline
                     move={move}
-                    onAdd={(tag, type) => {
-                      const nv = makeVariant(tag, type);
+                    onAdd={(tag, type, subtype) => {
+                      const nv = makeVariant(tag, type, subtype);
                       updateCharacter({
                         ...character,
                         moves: {
@@ -2208,7 +3248,7 @@ const MoveTree = ({
  * ======================================================================== */
 
 const CopyLuauButton = ({ character, t }) => {
-  const [state, setState] = useState("idle");
+  const [state, setState] = useState("idle"); // idle | copied | error
   const timeoutRef = useRef(null);
 
   useEffect(
@@ -2224,6 +3264,8 @@ const CopyLuauButton = ({ character, t }) => {
       if (navigator.clipboard && window.isSecureContext !== false) {
         await navigator.clipboard.writeText(code);
       } else {
+        // Fallback: hidden textarea + execCommand (works in sandboxed iframes
+        // where the async Clipboard API is often blocked).
         const ta = document.createElement("textarea");
         ta.value = code;
         ta.style.position = "fixed";
@@ -2259,24 +3301,31 @@ const CopyLuauButton = ({ character, t }) => {
 };
 
 const CharacterHeader = ({ character, updateCharacter, goToRoster, t }) => (
-  <header className={`border-b ${t.border} pb-6 mb-8`}>
-    <div className="flex items-center gap-2 mb-2 px-2">
+  <header className={`border-b ${t.border} pb-7 mb-8`}>
+    <div className="flex items-center gap-2 mb-3">
       {goToRoster && (
         <button
           onClick={goToRoster}
-          className={`text-[11px] px-2 py-1 rounded ${t.hover} ${t.sub} inline-flex items-center gap-1`}
+          className={`text-[11px] px-2 py-1 rounded ${t.hover} ${t.sub} inline-flex items-center gap-1 font-medium`}
           title="Back to roster"
         >
           <ChevronRight size={12} className="rotate-180" /> Roster
         </button>
       )}
-      <Tv size={13} className={t.faint} />
-      <input
-        value={character.anime}
-        onChange={(e) => updateCharacter({ ...character, anime: e.target.value })}
-        placeholder="Anime / source name"
-        className={`bg-transparent outline-none text-sm rounded px-2 py-1 ${t.hover} ${t.sub} flex-1 min-w-0`}
-      />
+      <span className={`text-[11px] ${t.faint}`}>/</span>
+      <div
+        className={`flex items-center gap-1.5 flex-1 min-w-0 rounded px-2 py-1 ${t.hover}`}
+      >
+        <Tv size={12} className={t.faint} />
+        <input
+          value={character.anime}
+          onChange={(e) =>
+            updateCharacter({ ...character, anime: e.target.value })
+          }
+          placeholder="Anime / source name"
+          className={`bg-transparent outline-none text-[13px] ${t.sub} flex-1 min-w-0`}
+        />
+      </div>
       <CopyLuauButton character={character} t={t} />
     </div>
 
@@ -2284,10 +3333,10 @@ const CharacterHeader = ({ character, updateCharacter, goToRoster, t }) => (
       value={character.name}
       onChange={(e) => updateCharacter({ ...character, name: e.target.value })}
       placeholder="Character name"
-      className={`w-full bg-transparent outline-none text-4xl font-semibold tracking-tight rounded px-2 py-1 ${t.hover}`}
+      className={`w-full bg-transparent outline-none text-4xl font-semibold tracking-tight leading-tight rounded px-2 -mx-2 py-1 ${t.hover}`}
     />
 
-    <div className="mt-6">
+    <div className="mt-6 space-y-3">
       <Toggle title="Core Gimmick" icon={Sparkles} t={t}>
         <Area
           value={character.gimmick}
@@ -2298,12 +3347,237 @@ const CharacterHeader = ({ character, updateCharacter, goToRoster, t }) => (
           className={`text-sm ${t.sub}`}
         />
       </Toggle>
+      <PassivesPanel character={character} updateCharacter={updateCharacter} t={t} />
     </div>
   </header>
 );
 
 /* ===========================================================================
- * Roster Screen
+ * Passives — a character-level list of persistent mechanics. Each passive
+ * can declare typed variables that move variants then bind to via the
+ * Variable Interactions block in the Spec Sheet.
+ * ======================================================================== */
+
+const PASSIVE_VAR_KINDS = ["number", "boolean", "text", "enum"];
+
+const PassiveVariableEditor = ({ passive, variable, updatePassive, t }) => {
+  const patch = (partial) => {
+    updatePassive({
+      ...passive,
+      variables: passive.variables.map((v) =>
+        v.id === variable.id ? { ...v, ...partial } : v
+      ),
+    });
+  };
+  const remove = () => {
+    updatePassive({
+      ...passive,
+      variables: passive.variables.filter((v) => v.id !== variable.id),
+    });
+  };
+  return (
+    <tr className={`border-t ${t.subBorder}`}>
+      <td className="px-2 py-1 w-40">
+        <Field
+          value={variable.name}
+          onChange={(v) => patch({ name: v })}
+          placeholder="HeatStacks"
+          t={t}
+          className="font-mono text-sm"
+        />
+      </td>
+      <td className="px-2 py-1 w-24">
+        <Picker
+          value={variable.kind}
+          onChange={(v) => patch({ kind: v })}
+          options={PASSIVE_VAR_KINDS}
+          t={t}
+          className="text-xs"
+        />
+      </td>
+      <td className="px-2 py-1 w-24">
+        <Field
+          value={variable.initial}
+          onChange={(v) => patch({ initial: v })}
+          placeholder="0"
+          t={t}
+          className="font-mono text-xs tabular-nums"
+        />
+      </td>
+      <td className="px-2 py-1">
+        <Field
+          value={variable.description}
+          onChange={(v) => patch({ description: v })}
+          placeholder="What this tracks / its range"
+          t={t}
+          className={`text-xs ${t.sub}`}
+        />
+      </td>
+      <td className="px-1">
+        <ConfirmDelete onConfirm={remove} t={t} icon={X} size={12} />
+      </td>
+    </tr>
+  );
+};
+
+const PassiveCard = ({ passive, updatePassive, removePassive, character, t }) => {
+  return (
+    <div className={`rounded-lg border ${t.border} ${t.surface}`}>
+      <div className={`flex items-center gap-2 px-3 py-2 border-b ${t.subBorder}`}>
+        <Star size={14} className={t.accent} />
+        <input
+          value={passive.name}
+          onChange={(e) => updatePassive({ ...passive, name: e.target.value })}
+          placeholder="Passive name"
+          className={`flex-1 bg-transparent outline-none text-sm font-medium rounded px-1 ${t.hover}`}
+        />
+        <ConfirmDelete onConfirm={removePassive} t={t} title="Delete passive" />
+      </div>
+      <div className="p-3 space-y-2">
+        <Area
+          value={passive.description}
+          onChange={(v) => updatePassive({ ...passive, description: v })}
+          placeholder="What this passive does, when it triggers, its mechanics…"
+          rows={2}
+          t={t}
+          className={`text-xs ${t.sub}`}
+        />
+
+        <div>
+          <div className="flex items-center justify-between mb-1.5">
+            <div className={`text-[11px] uppercase tracking-wider ${t.faint}`}>
+              Variables · {passive.variables.length}
+            </div>
+            <button
+              onClick={() =>
+                updatePassive({
+                  ...passive,
+                  variables: [...passive.variables, makePassiveVariable()],
+                })
+              }
+              className={`text-[11px] px-2 py-0.5 rounded ${t.hover} ${t.sub} inline-flex items-center gap-1`}
+            >
+              <Plus size={10} /> Variable
+            </button>
+          </div>
+          {passive.variables.length === 0 ? (
+            <div className={`text-[11px] ${t.faint} italic px-1`}>
+              No variables yet. Variables can be referenced from any variant's
+              Spec Sheet as Variable Interactions.
+            </div>
+          ) : (
+            <div className={`rounded border ${t.border} overflow-hidden`}>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className={`${t.surfaceAlt} ${t.sub}`}>
+                    <th className="text-left px-2 py-1 text-[10px] uppercase tracking-wider">
+                      Name
+                    </th>
+                    <th className="text-left px-2 py-1 text-[10px] uppercase tracking-wider">
+                      Kind
+                    </th>
+                    <th className="text-left px-2 py-1 text-[10px] uppercase tracking-wider">
+                      Initial
+                    </th>
+                    <th className="text-left px-2 py-1 text-[10px] uppercase tracking-wider">
+                      Description
+                    </th>
+                    <th className="w-8"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {passive.variables.map((v) => (
+                    <PassiveVariableEditor
+                      key={v.id}
+                      passive={passive}
+                      variable={v}
+                      updatePassive={updatePassive}
+                      t={t}
+                    />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        {character && (
+          <ReferencesSection
+            owner={passive}
+            references={passive.references || []}
+            updateReferences={(refs) =>
+              updatePassive({ ...passive, references: refs })
+            }
+            character={character}
+            t={t}
+            title="Mentions"
+          />
+        )}
+      </div>
+    </div>
+  );
+};
+
+const PassivesPanel = ({ character, updateCharacter, t }) => {
+  const passives = character.passives || [];
+  const updatePassive = (updated) =>
+    updateCharacter({
+      ...character,
+      passives: passives.map((p) => (p.id === updated.id ? updated : p)),
+    });
+  const addPassive = () =>
+    updateCharacter({
+      ...character,
+      passives: [...passives, makePassive({ name: "New Passive" })],
+    });
+  const removePassive = (id) =>
+    updateCharacter({
+      ...character,
+      passives: passives.filter((p) => p.id !== id),
+    });
+
+  return (
+    <Toggle
+      title="Passives"
+      icon={Star}
+      t={t}
+      meta={`${passives.length} passive${passives.length === 1 ? "" : "s"}`}
+      action={
+        <IconBtn t={t} onClick={addPassive} title="Add passive">
+          <Plus size={12} /> Add
+        </IconBtn>
+      }
+    >
+      {passives.length === 0 ? (
+        <div
+          className={`rounded-lg border border-dashed ${t.border} ${t.soft} py-6 text-center ${t.faint} text-xs`}
+        >
+          No passives yet. Use passives for meters, stances, auras, stacks —
+          anything always-on or ambient. Declare variables to reference from
+          move variants.
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {passives.map((p) => (
+            <PassiveCard
+              key={p.id}
+              passive={p}
+              updatePassive={updatePassive}
+              removePassive={() => removePassive(p.id)}
+              character={character}
+              t={t}
+            />
+          ))}
+        </div>
+      )}
+    </Toggle>
+  );
+};
+
+/* ===========================================================================
+ * Roster Screen — the landing view. Groups characters by anime and shows
+ * a card grid per anime so the whole roster is visible at once before
+ * drilling into a single character's editor.
  * ======================================================================== */
 
 const AnimeRosterCard = ({
@@ -2321,13 +3595,15 @@ const AnimeRosterCard = ({
   const primaryMove = character.moves[character.enabledSlots[0]];
   const awakening = character.moves.awakening;
 
+  const passiveCount = (character.passives || []).length;
+
   return (
     <div
-      className={`rounded-xl border ${t.border} ${t.surface} p-4 flex flex-col gap-3 transition-shadow hover:shadow-md group`}
+      className={`rounded-xl border ${t.border} ${t.surface} p-4 flex flex-col gap-3 transition-all hover:shadow-md hover:-translate-y-0.5 group cursor-default relative`}
     >
-      <div className="flex items-start gap-2">
+      <div className="flex items-start gap-3">
         <div
-          className={`w-10 h-10 rounded-md flex items-center justify-center ${t.accentBg} ${t.accent} shrink-0`}
+          className={`w-10 h-10 rounded-md flex items-center justify-center ${t.accentBg} ${t.accent} shrink-0 transition-transform group-hover:scale-105`}
         >
           <Sparkles size={18} />
         </div>
@@ -2338,15 +3614,26 @@ const AnimeRosterCard = ({
               updateCharacter({ ...character, name: e.target.value })
             }
             placeholder="Character name"
-            className={`w-full bg-transparent outline-none text-lg font-semibold tracking-tight ${t.hover} rounded px-1 -mx-1`}
+            className={`w-full bg-transparent outline-none text-lg font-semibold tracking-tight leading-tight ${t.hover} rounded px-1 -mx-1`}
           />
-          <div className={`text-[11px] ${t.faint} mt-0.5 truncate`}>
-            {character.enabledSlots.length} slot
-            {character.enabledSlots.length === 1 ? "" : "s"} · {moveCount}{" "}
-            variant{moveCount === 1 ? "" : "s"}
-            {awakening?.finisherKind
-              ? ` · ${awakening.finisherKind}`
-              : ""}
+          <div className={`text-[11px] ${t.faint} mt-1 flex items-center gap-1.5 flex-wrap`}>
+            <span className="tabular-nums">{character.enabledSlots.length} slots</span>
+            <span className="opacity-50">·</span>
+            <span className="tabular-nums">{moveCount} variants</span>
+            {passiveCount > 0 && (
+              <>
+                <span className="opacity-50">·</span>
+                <span className="tabular-nums">
+                  {passiveCount} passive{passiveCount === 1 ? "" : "s"}
+                </span>
+              </>
+            )}
+            {awakening?.finisherKind && (
+              <>
+                <span className="opacity-50">·</span>
+                <span className={t.accent}>{awakening.finisherKind}</span>
+              </>
+            )}
           </div>
         </div>
         <ConfirmDelete
@@ -2367,31 +3654,30 @@ const AnimeRosterCard = ({
           const m = character.moves[k];
           const slot = DEFAULT_SLOTS.find((s) => s.key === k);
           const label = m.name || slot?.label || k;
+          const VIcon = m.variants[0] ? iconForVariant(m.variants[0]) : Sparkles;
           return (
             <span
               key={k}
-              className={`text-[10px] px-1.5 py-0.5 rounded border ${t.border} ${t.soft} ${t.sub} truncate max-w-[140px]`}
-              title={label}
+              className={`text-[10px] px-1.5 py-0.5 rounded border ${t.border} ${t.soft} ${t.sub} truncate max-w-[160px] inline-flex items-center gap-1`}
+              title={`${slot?.label || k}: ${label}`}
             >
+              <VIcon size={9} className={`${t.faint} shrink-0`} />
               {label}
             </span>
           );
         })}
       </div>
 
-      <div className="flex items-center gap-2 mt-auto pt-1">
+      <div
+        className={`flex items-center gap-2 mt-auto pt-2 border-t ${t.subBorder}`}
+      >
         <button
           onClick={onOpen}
-          className={`text-xs px-3 py-1.5 rounded-md border ${t.border} ${t.hover} inline-flex items-center gap-1 ${t.accent}`}
+          className={`text-xs px-3 py-1.5 rounded-md border ${t.border} ${t.hover} inline-flex items-center gap-1 ${t.accent} font-medium`}
         >
           Open moveset <ChevronRight size={12} />
         </button>
         <CopyLuauButton character={character} t={t} />
-        {primaryMove?.name && (
-          <span className={`text-[11px] ${t.faint} ml-auto truncate`}>
-            ↳ {primaryMove.name}
-          </span>
-        )}
       </div>
     </div>
   );
@@ -2405,38 +3691,99 @@ const RosterScreen = ({
   updateCharacter,
   t,
 }) => {
+  const [query, setQuery] = useState("");
+
+  // Group characters by anime name. Preserve original order within a group.
+  // Filter is applied per-group so empty groups disappear when searching.
   const groups = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const matches = (c) => {
+      if (!q) return true;
+      const haystack = [
+        c.name || "",
+        c.anime || "",
+        c.gimmick || "",
+      ]
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(q);
+    };
     const m = new Map();
     characters.forEach((c) => {
+      if (!matches(c)) return;
       const key = (c.anime || "Untitled Anime").trim() || "Untitled Anime";
       if (!m.has(key)) m.set(key, []);
       m.get(key).push(c);
     });
     return Array.from(m.entries());
-  }, [characters]);
+  }, [characters, query]);
+
+  const totalShown = groups.reduce((acc, [, g]) => acc + g.length, 0);
 
   return (
     <div className="max-w-6xl mx-auto px-10 py-10">
-      <header className={`border-b ${t.border} pb-5 mb-8 flex items-end justify-between gap-4`}>
-        <div>
-          <div className={`text-[11px] uppercase tracking-wider ${t.faint}`}>
-            Anime Moveset Wiki
+      <header className={`border-b ${t.border} pb-6 mb-8`}>
+        <div className="flex items-end justify-between gap-4">
+          <div className="min-w-0">
+            <div className={`text-[11px] uppercase tracking-[0.18em] ${t.faint} font-medium`}>
+              Anime Moveset Wiki
+            </div>
+            <h1 className="text-3xl font-semibold tracking-tight mt-1.5">
+              Your Roster
+            </h1>
+            <div className={`text-sm ${t.sub} mt-1.5`}>
+              {characters.length} character{characters.length === 1 ? "" : "s"}{" "}
+              across {
+                new Set(
+                  characters.map((c) => (c.anime || "Untitled").trim() || "Untitled")
+                ).size
+              }{" "}
+              source
+              {new Set(
+                characters.map((c) => (c.anime || "Untitled").trim() || "Untitled")
+              ).size === 1
+                ? ""
+                : "s"}
+              . Click any card to dive into its moveset.
+            </div>
           </div>
-          <h1 className="text-3xl font-semibold tracking-tight mt-1">
-            Your Roster
-          </h1>
-          <div className={`text-sm ${t.sub} mt-1`}>
-            {characters.length} character{characters.length === 1 ? "" : "s"}{" "}
-            across {groups.length} source{groups.length === 1 ? "" : "s"}.
-            Click any card to dive into its moveset.
-          </div>
+          <button
+            onClick={addCharacter}
+            className={`text-sm px-3 py-2 rounded-md border ${t.border} ${t.hover} inline-flex items-center gap-1.5 ${t.accent} shrink-0`}
+          >
+            <Plus size={14} /> New character
+          </button>
         </div>
-        <button
-          onClick={addCharacter}
-          className={`text-sm px-3 py-2 rounded-md border ${t.border} ${t.hover} inline-flex items-center gap-1 ${t.accent}`}
-        >
-          <Plus size={14} /> New character
-        </button>
+
+        {characters.length > 0 && (
+          <div className="mt-5 flex items-center gap-2">
+            <div
+              className={`flex items-center gap-2 flex-1 rounded-md border ${t.border} ${t.surface} px-3 py-1.5 max-w-md`}
+            >
+              <Search size={13} className={t.faint} />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search characters, anime, gimmicks…"
+                className="flex-1 bg-transparent outline-none text-sm"
+              />
+              {query && (
+                <button
+                  onClick={() => setQuery("")}
+                  className={`${t.faint} ${t.hover} rounded p-0.5`}
+                  title="Clear search"
+                >
+                  <X size={12} />
+                </button>
+              )}
+            </div>
+            {query && (
+              <span className={`text-[11px] ${t.faint}`}>
+                {totalShown} match{totalShown === 1 ? "" : "es"}
+              </span>
+            )}
+          </div>
+        )}
       </header>
 
       {characters.length === 0 ? (
@@ -2454,18 +3801,38 @@ const RosterScreen = ({
             <Plus size={14} /> Add character
           </button>
         </div>
+      ) : groups.length === 0 ? (
+        <div
+          className={`rounded-xl border border-dashed ${t.border} ${t.soft} py-12 flex flex-col items-center justify-center gap-2 ${t.faint}`}
+        >
+          <Search size={22} />
+          <div className="text-sm">
+            No characters match{" "}
+            <span className={t.sub}>"{query}"</span>.
+          </div>
+          <button
+            onClick={() => setQuery("")}
+            className={`mt-1 text-xs px-3 py-1.5 rounded-md border ${t.border} ${t.hover}`}
+          >
+            Clear search
+          </button>
+        </div>
       ) : (
         <div className="space-y-10">
           {groups.map(([anime, group]) => (
             <section key={anime}>
-              <div className={`flex items-baseline justify-between mb-3 pb-2 border-b ${t.subBorder}`}>
-                <div className="flex items-center gap-2">
-                  <Tv size={14} className={t.accent} />
-                  <h2 className="text-base font-semibold tracking-tight">
+              <div
+                className={`flex items-baseline justify-between mb-4 pb-2 border-b ${t.subBorder}`}
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <Tv size={13} className={t.accent} />
+                  <h2 className="text-[13px] font-semibold tracking-tight uppercase">
                     {anime}
                   </h2>
-                  <span className={`text-[11px] ${t.faint}`}>
-                    · {group.length} character{group.length === 1 ? "" : "s"}
+                  <span
+                    className={`text-[10px] uppercase tracking-wider ${t.faint} ml-1`}
+                  >
+                    {group.length} character{group.length === 1 ? "" : "s"}
                   </span>
                 </div>
               </div>
@@ -2491,7 +3858,7 @@ const RosterScreen = ({
 };
 
 /* ===========================================================================
- * Accent Picker
+ * Accent Picker — preset swatches + native <input type="color"> for custom.
  * ======================================================================== */
 
 const AccentPicker = ({ accent, setAccent, t }) => {
@@ -2601,7 +3968,7 @@ const VariantEditor = ({
     ? move.finisherKind === "Ultimate"
       ? Star
       : Sparkles
-    : MOVE_TYPES[variant.type].icon;
+    : iconForVariant(variant);
 
   return (
     <div>
@@ -2643,6 +4010,8 @@ const VariantEditor = ({
         className={`w-full bg-transparent outline-none text-3xl font-semibold tracking-tight rounded px-2 py-1 ${t.hover}`}
       />
 
+      {/* Media gallery moved above the description — so references sit
+       * at the top of the editor where you read the move from. */}
       <div className="mt-4">
         <MediaGallery variant={variant} updateVariant={updateVariant} t={t} />
       </div>
@@ -2679,9 +4048,42 @@ const VariantEditor = ({
       </div>
 
       <div className="space-y-3">
+        <SectionGroup label="Definition" t={t} />
         <ClassificationSection variant={variant} updateVariant={updateVariant} t={t} />
         <SpecSheet variant={variant} updateVariant={updateVariant} t={t} />
+        <VariableInteractionsSection
+          variant={variant}
+          updateVariant={updateVariant}
+          character={character}
+          t={t}
+        />
+        <ReferencesSection
+          owner={variant}
+          references={variant.references || []}
+          updateReferences={(refs) =>
+            updateVariant({ ...variant, references: refs })
+          }
+          character={character}
+          t={t}
+          excludeVariantId={variant.id}
+        />
+
+        {variant.type === "Special" && variant.subtype === "Awakening" && (
+          <>
+            <SectionGroup label="Sub-Moveset" t={t} />
+            <SubMovesetSection
+              variant={variant}
+              updateVariant={updateVariant}
+              character={character}
+              t={t}
+            />
+          </>
+        )}
+
+        <SectionGroup label="Animation" t={t} />
         <KeyframeMarkers variant={variant} updateVariant={updateVariant} t={t} />
+
+        <SectionGroup label="Notes" t={t} />
         <FlavorBlock variant={variant} updateVariant={updateVariant} t={t} />
         <ComboSynergy variant={variant} updateVariant={updateVariant} t={t} />
         <ScalingLogic variant={variant} updateVariant={updateVariant} t={t} />
@@ -2699,80 +4101,69 @@ export default function App() {
   const [accent, setAccent] = useState(DEFAULT_ACCENT);
   const t = useMemo(() => makeTheme(dark), [dark]);
 
-  const [characters, setCharacters] = useState([]);
+  const [characters, setCharacters] = useState(seed);
   const [view, setView] = useState("roster"); // "roster" | "character"
-  const [activeCharacterId, setActiveCharacterId] = useState(null);
+  const [activeCharacterId, setActiveCharacterId] = useState(
+    () => characters[0]?.id
+  );
   const [activeMoveKey, setActiveMoveKey] = useState("move1");
-  const [activeVariantId, setActiveVariantId] = useState(null);
+  const [activeVariantId, setActiveVariantId] = useState(
+    () => characters[0]?.moves.move1.variants[0]?.id
+  );
   const [expandedMoves, setExpandedMoves] = useState(() => new Set(["move1"]));
   const [minimizedCharacters, setMinimizedCharacters] = useState(() => new Set());
 
-  // 'loading' | 'idle' | 'pending' | 'saving' | 'saved' | 'error'
-  const [syncStatus, setSyncStatus] = useState("loading");
+  const [user, setUser] = useState(null);
+  const [isAuthLoaded, setIsAuthLoaded] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
 
-  const saveTimerRef = useRef(null);
-  const isLoadedRef = useRef(false);
-  const justLoaded = useRef(false);
-
-  // Fetch roster on mount; seed the JSON file on first run
   useEffect(() => {
-    (async () => {
-      try {
-        const raw = await invoke("load_characters");
-        const data = raw ? JSON.parse(raw) : null;
-        const loaded = data ?? seed();
-
-        justLoaded.current = true;
-        setCharacters(loaded);
-
-        if (loaded.length > 0) {
-          const first = loaded[0];
-          setActiveCharacterId(first.id);
-          const firstSlot = first.enabledSlots[0];
-          setActiveMoveKey(firstSlot);
-          setActiveVariantId(first.moves[firstSlot]?.variants[0]?.id ?? null);
-          setExpandedMoves(new Set([firstSlot]));
+    const unsub = onAuthStateChanged(auth, async (u) => {
+      setUser(u);
+      if (u) {
+        setIsSyncing(true);
+        const docRef = doc(db, "users", u.uid);
+        const snap = await getDoc(docRef);
+        if (snap.exists()) {
+          const data = snap.data();
+          if (data.characters && data.characters.length > 0) {
+            setCharacters(data.characters);
+          } else {
+            await setDoc(docRef, { characters });
+          }
+        } else {
+          await setDoc(docRef, { characters });
         }
-
-        isLoadedRef.current = true;
-        setSyncStatus("idle");
-
-        // Persist seed data on first run so the file exists next time
-        if (data === null) {
-          await invoke("save_characters", { data: JSON.stringify(loaded) });
-        }
-      } catch {
-        setSyncStatus("error");
+        setIsSyncing(false);
       }
-    })();
+      setIsAuthLoaded(true);
+    });
+    return unsub;
   }, []);
 
-  // Debounced auto-save — skips the render triggered by the initial load
+  const firstRender = useRef(true);
   useEffect(() => {
-    if (!isLoadedRef.current) return;
-    if (justLoaded.current) {
-      justLoaded.current = false;
+    if (firstRender.current) {
+      firstRender.current = false;
       return;
     }
+    if (user && !isSyncing) {
+      const docRef = doc(db, "users", user.uid);
+      setDoc(docRef, { characters }, { merge: true });
+    }
+  }, [characters, user, isSyncing]);
 
-    setSyncStatus("pending");
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (err) {
+      console.error(err);
+    }
+  };
 
-    saveTimerRef.current = setTimeout(async () => {
-      setSyncStatus("saving");
-      try {
-        await invoke("save_characters", { data: JSON.stringify(characters) });
-        setSyncStatus("saved");
-        setTimeout(() => setSyncStatus("idle"), 2000);
-      } catch {
-        setSyncStatus("error");
-      }
-    }, 800);
-
-    return () => {
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    };
-  }, [characters]);
+  const handleLogout = async () => {
+    await signOut(auth);
+  };
 
   const character = characters.find((c) => c.id === activeCharacterId);
   const move =
@@ -2854,6 +4245,7 @@ export default function App() {
       className={`min-h-screen font-sans ${t.page}`}
       style={{ "--accent": accent }}
     >
+      {/* Inject the accent CSS classes into the document once. */}
       <style>{ACCENT_CSS}</style>
 
       <div className="flex">
@@ -2910,17 +4302,28 @@ export default function App() {
             )}
           </div>
 
-          <div className={`border-t ${t.border} p-3 flex items-center justify-between gap-1`}>
-            <div className="flex items-center gap-2">
+          <div className={`border-t ${t.border} p-3 flex flex-col gap-2`}>
+            {user ? (
+              <div className={`flex items-center justify-between text-xs ${t.faint}`}>
+                <span className="truncate">Cloud Save: On (${user.email || 'Logged in'})</span>
+                <button onClick={handleLogout} className={`underline ${t.hover} rounded px-1`}>Logout</button>
+              </div>
+            ) : (
               <button
-                onClick={goToRoster}
-                className={`text-[11px] ${t.faint} ${t.hover} rounded px-1.5 py-1 truncate`}
-                title="Back to roster"
+                onClick={handleLogin}
+                className={`w-full text-xs py-1.5 rounded-md border ${t.border} ${t.hover} ${t.text} font-medium flex items-center justify-center gap-2`}
               >
-                {view === "roster" ? "Roster view" : "← Roster"}
+                Sign in for Cloud Save
               </button>
-              <SyncIndicator status={syncStatus} t={t} />
-            </div>
+            )}
+            <div className="flex items-center justify-between gap-1">
+            <button
+              onClick={goToRoster}
+              className={`text-[11px] ${t.faint} ${t.hover} rounded px-1.5 py-1 truncate`}
+              title="Back to roster"
+            >
+              {view === "roster" ? "Roster view" : "← Roster"}
+            </button>
             <div className="flex items-center gap-1">
               <AccentPicker accent={accent} setAccent={setAccent} t={t} />
               <button
@@ -2932,16 +4335,12 @@ export default function App() {
               </button>
             </div>
           </div>
+          </div>
         </aside>
 
         {/* Main */}
         <main className="flex-1 min-w-0">
-          {syncStatus === "loading" ? (
-            <div className="flex items-center justify-center h-[60vh] gap-2">
-              <Loader2 size={20} className={`${t.faint} animate-spin`} />
-              <span className={`text-sm ${t.sub}`}>Loading characters…</span>
-            </div>
-          ) : view === "roster" ? (
+          {view === "roster" ? (
             <RosterScreen
               characters={characters}
               selectCharacter={selectCharacter}
@@ -2952,53 +4351,53 @@ export default function App() {
             />
           ) : (
             <div className="max-w-4xl mx-auto px-10 py-12">
-              {character ? (
-                <>
-                  <CharacterHeader
-                    goToRoster={goToRoster}
+            {character ? (
+              <>
+                <CharacterHeader
+                  goToRoster={goToRoster}
+                  character={character}
+                  updateCharacter={updateCharacter}
+                  t={t}
+                />
+                {variant ? (
+                  <VariantEditor
                     character={character}
+                    moveKey={activeMoveKey}
+                    variant={variant}
                     updateCharacter={updateCharacter}
                     t={t}
                   />
-                  {variant ? (
-                    <VariantEditor
-                      character={character}
-                      moveKey={activeMoveKey}
-                      variant={variant}
-                      updateCharacter={updateCharacter}
-                      t={t}
-                    />
-                  ) : (
-                    <div className={`text-sm ${t.sub}`}>
-                      Select a variant from the sidebar to begin editing.
-                    </div>
-                  )}
-                  <footer
-                    className={`mt-16 pt-6 border-t ${t.border} text-xs ${t.faint} flex items-center justify-between`}
-                  >
-                    <span>
-                      {character.name} · {character.anime}
-                    </span>
-                    <span>
-                      {character.enabledSlots.reduce(
-                        (acc, k) => acc + character.moves[k].variants.length,
-                        0
-                      )}{" "}
-                      variants across {character.enabledSlots.length} slots
-                    </span>
-                  </footer>
-                </>
-              ) : (
-                <div className={`text-sm ${t.sub} flex flex-col items-center justify-center h-[60vh] gap-3`}>
-                  <div>No characters in roster.</div>
-                  <button
-                    onClick={addCharacter}
-                    className={`text-sm px-4 py-2 rounded-md border ${t.border} ${t.hover} inline-flex items-center gap-1`}
-                  >
-                    <Plus size={14} /> Add character
-                  </button>
-                </div>
-              )}
+                ) : (
+                  <div className={`text-sm ${t.sub}`}>
+                    Select a variant from the sidebar to begin editing.
+                  </div>
+                )}
+                <footer
+                  className={`mt-16 pt-6 border-t ${t.border} text-xs ${t.faint} flex items-center justify-between`}
+                >
+                  <span>
+                    {character.name} · {character.anime}
+                  </span>
+                  <span>
+                    {character.enabledSlots.reduce(
+                      (acc, k) => acc + character.moves[k].variants.length,
+                      0
+                    )}{" "}
+                    variants across {character.enabledSlots.length} slots
+                  </span>
+                </footer>
+              </>
+            ) : (
+              <div className={`text-sm ${t.sub} flex flex-col items-center justify-center h-[60vh] gap-3`}>
+                <div>No characters in roster.</div>
+                <button
+                  onClick={addCharacter}
+                  className={`text-sm px-4 py-2 rounded-md border ${t.border} ${t.hover} inline-flex items-center gap-1`}
+                >
+                  <Plus size={14} /> Add character
+                </button>
+              </div>
+            )}
             </div>
           )}
         </main>
