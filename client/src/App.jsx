@@ -1488,7 +1488,14 @@ const MEDIA_TYPE_META = {
 };
 
 const MediaItem = ({ item, t, onRemove, onRelabel }) => {
-  const displayUrl = item.source === "file" ? convertFileSrc(item.url) : item.url;
+  let displayUrl = item.url;
+  if (item.source === "file") {
+    try {
+      displayUrl = convertFileSrc(item.url);
+    } catch (err) {
+      displayUrl = item.url;
+    }
+  }
   const yt = youtubeId(item.url);
   const sm = streamableId(item.url);
   const Meta = MEDIA_TYPE_META[item.kind] || MEDIA_TYPE_META.link;
@@ -1623,10 +1630,17 @@ const MediaGallery = ({ variant, updateVariant, t }) => {
         for (let i = 0; i < bytes.length; i += chunkSize) {
           binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
         }
-        const localPath = await invoke("save_media", {
-          fileName: file.name,
-          data: btoa(binary),
-        });
+        let localPath = "";
+        try {
+          // If running in Tauri, save to local disk
+          localPath = await invoke("save_media", {
+            fileName: file.name,
+            data: btoa(binary),
+          });
+        } catch (err) {
+          // Fallback for web browser: use base64 data URL
+          localPath = `data:${file.type};base64,${btoa(binary)}`;
+        }
         return {
           id: newId(),
           kind: detectMediaType(file.name, file.type),
