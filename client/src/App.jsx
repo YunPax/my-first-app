@@ -458,6 +458,16 @@ const DEFAULT_SLOTS = [
   { key: "awakening", label: "Awakening / Ultimate", removable: false, isFinisher: true },
 ];
 
+/* Slot relationship types — controls special behavior per move slot. */
+const SLOT_RELATIONS = ["None", "SubMode", "Awakening", "Special"];
+
+const SLOT_RELATION_META = {
+  None:      { label: "None",      cls: "" },
+  SubMode:   { label: "SubMode",   cls: "text-blue-400 bg-blue-400/10 border-blue-400/30" },
+  Awakening: { label: "Awakening", cls: "text-amber-400 bg-amber-400/10 border-amber-400/30" },
+  Special:   { label: "Special",   cls: "text-purple-400 bg-purple-400/10 border-purple-400/30" },
+};
+
 /* ===========================================================================
  * Helpers
  * ======================================================================== */
@@ -518,6 +528,22 @@ const makeFinisher = (kind = "Awakening") => ({
   finisherKind: kind,
 });
 
+/* Seed 4 blank awakening submoves for mandatory Awakening slots. */
+const seedAwakeningSubmoves = () =>
+  Array.from({ length: 4 }, (_, i) => ({
+    id: newId(),
+    name: `Awakening Move ${i + 1}`,
+    description: "",
+    variants: [makeVariant("Ground", "Attack", "Physical")],
+  }));
+
+/* Custom slot descriptor: stored in character.customSlots[]. */
+const makeCustomSlot = (label = "New Move", relation = "None") => ({
+  key: `custom_${newId()}`,
+  label,
+  relation,
+});
+
 /* Passive abilities — persistent effects / state tables. Each passive can
  * declare variables that any move variant can then "bind to" via the
  * Variable Interactions editor in its Spec Sheet.                         */
@@ -554,6 +580,9 @@ const makeCharacter = (overrides = {}) => ({
     awakening: makeFinisher("Awakening"),
   },
   passives: [],
+  /* Array of { key, label, relation } for user-created slots beyond the
+   * fixed move1-move4 / utility / awakening set.                        */
+  customSlots: [],
   ...overrides,
 });
 
@@ -689,6 +718,28 @@ const seed = () => {
   return [yumi, asahi];
 };
 
+/* Return a unified ordered list of slot descriptors for a character,
+ * covering both fixed (DEFAULT_SLOTS) and user-created (customSlots).
+ * Each entry: { key, label, removable, isFinisher, relation, isCustom } */
+const getAllSlots = (character) => {
+  const fixed = DEFAULT_SLOTS
+    .filter((s) => character.enabledSlots.includes(s.key))
+    .map((s) => ({
+      ...s,
+      relation: s.key === "awakening" ? "Awakening" : "None",
+      isCustom: false,
+    }));
+  const custom = (character.customSlots || []).map((cs) => ({
+    key: cs.key,
+    label: cs.label,
+    relation: cs.relation || "None",
+    removable: true,
+    isFinisher: false,
+    isCustom: true,
+  }));
+  return [...fixed, ...custom];
+};
+
 /* ===========================================================================
  * Luau export — serialize a character into a Roblox Studio module script
  * with local Cooldowns / Damages / Endlag / Stuns tables and an Info table
@@ -818,9 +869,9 @@ const SPEC_HANDLED_KEYS = new Set([
 ]);
 
 const characterToLuau = (character) => {
-  const slotMoves = DEFAULT_SLOTS.filter((s) =>
-    character.enabledSlots.includes(s.key)
-  ).map((s) => ({ slot: s, move: character.moves[s.key] }));
+  const slotMoves = getAllSlots(character)
+    .map((s) => ({ slot: s, move: character.moves[s.key] }))
+    .filter((sm) => sm.move != null);
 
   const cooldowns = [];
   const damages = [];
@@ -1174,6 +1225,9 @@ const characterToLuau = (character) => {
     if (move.description) push(`\t\t\tDescription = ${luaString(move.description)},`);
     if (slot.isFinisher) push(`\t\t\tFinisherKind = ${luaString(move.finisherKind || "Awakening")},`);
     push(`\t\t\tSlot = ${luaString(slot.label)},`);
+    if (slot.relation && slot.relation !== "None") {
+      push(`\t\t\tSlotRelation = ${luaString(slot.relation)},`);
+    }
     push(`\t\t\tVariants = {`);
 
     for (const v of move.variants) {
@@ -2606,28 +2660,26 @@ const VariableInteractionsSection = ({ variant, updateVariant, character, t }) =
 
 const buildReferenceCatalog = (character, excludeVariantId) => {
   const out = [];
-  DEFAULT_SLOTS.filter((s) => character.enabledSlots.includes(s.key)).forEach(
-    (slot) => {
-      const move = character.moves[slot.key];
-      if (!move) return;
+  getAllSlots(character).forEach((slot) => {
+    const move = character.moves[slot.key];
+    if (!move) return;
+    out.push({
+      id: `move:${slot.key}`,
+      kind: "move",
+      label: `${slot.label}: ${move.name || "Untitled"}`,
+      targetId: slot.key,
+    });
+    move.variants.forEach((v) => {
+      if (v.id === excludeVariantId) return;
       out.push({
-        id: `move:${slot.key}`,
-        kind: "move",
-        label: `${slot.label}: ${move.name || "Untitled"}`,
-        targetId: slot.key,
+        id: `variant:${v.id}`,
+        kind: "variant",
+        label: `${move.name || slot.label} · ${v.tag} (${v.type}${v.subtype ? "/" + v.subtype : ""})`,
+        targetId: v.id,
+        parentMoveKey: slot.key,
       });
-      move.variants.forEach((v) => {
-        if (v.id === excludeVariantId) return;
-        out.push({
-          id: `variant:${v.id}`,
-          kind: "variant",
-          label: `${move.name || slot.label} · ${v.tag} (${v.type}${v.subtype ? "/" + v.subtype : ""})`,
-          targetId: v.id,
-          parentMoveKey: slot.key,
-        });
-      });
-    }
-  );
+    });
+  });
   (character.passives || []).forEach((p) => {
     out.push({
       id: `passive:${p.id}`,
@@ -2901,22 +2953,28 @@ const SubVariantEditor = ({ subvariant, updateSubvariant, removeSubvariant, char
   );
 };
 
-const SubMoveCard = ({ submove, updateSubmove, removeSubmove, character, t }) => {
+const SubMoveCard = ({ submove, updateSubmove, removeSubmove, isMandatory = false, character, t }) => {
   const setVariants = (variants) => updateSubmove({ ...submove, variants });
   const updateSubvariant = (updated) =>
     setVariants(submove.variants.map((v) => (v.id === updated.id ? updated : v)));
 
   return (
-    <div className={`rounded-xl border ${t.border} ${t.surface} p-3 space-y-3`}>
+    <div className={`rounded-xl border ${isMandatory ? "border-amber-400/30" : t.border} ${t.surface} p-3 space-y-3`}>
       <div className="flex items-center gap-2">
-        <Flame size={14} className={t.accent} />
+        <Flame size={14} className={isMandatory ? "text-amber-400" : t.accent} />
         <input
           value={submove.name}
           onChange={(e) => updateSubmove({ ...submove, name: e.target.value })}
           placeholder="Sub-move name"
           className={`flex-1 bg-transparent outline-none text-base font-semibold tracking-tight rounded px-1 ${t.hover}`}
         />
-        <ConfirmDelete onConfirm={removeSubmove} t={t} title="Remove sub-move" />
+        {isMandatory ? (
+          <span className="text-[10px] px-1.5 py-0.5 rounded border text-amber-400 bg-amber-400/10 border-amber-400/30 ml-auto shrink-0">
+            Required
+          </span>
+        ) : (
+          removeSubmove && <ConfirmDelete onConfirm={removeSubmove} t={t} title="Remove sub-move" />
+        )}
       </div>
       <Area
         value={submove.description}
@@ -2952,16 +3010,34 @@ const SubMoveCard = ({ submove, updateSubmove, removeSubmove, character, t }) =>
   );
 };
 
-const SubMovesetSection = ({ variant, updateVariant, character, t }) => {
+const SubMovesetSection = ({ variant, updateVariant, character, t, isAwakening = false }) => {
   const submoves = variant.submoves || [];
   const setSubmoves = (next) => updateVariant({ ...variant, submoves: next });
 
+  // Pad to 4 mandatory submoves when this is an Awakening slot.
+  useEffect(() => {
+    if (!isAwakening) return;
+    const count = (variant.submoves || []).length;
+    if (count >= 4) return;
+    const padding = Array.from({ length: 4 - count }, (_, i) => ({
+      id: newId(),
+      name: `Awakening Move ${count + i + 1}`,
+      description: "",
+      variants: [makeVariant("Ground", "Attack", "Physical")],
+    }));
+    updateVariant({ ...variant, submoves: [...(variant.submoves || []), ...padding] });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAwakening]);
+
+  const title = isAwakening ? "Awakening Sub-Moveset" : "Sub-Moveset";
+  const metaSuffix = isAwakening ? " \u00b7 4 required" : "";
+
   return (
     <Toggle
-      title="Awakening Sub-Moveset"
+      title={title}
       icon={Flame}
       t={t}
-      meta={`${submoves.length} sub-move${submoves.length === 1 ? "" : "s"}`}
+      meta={`${submoves.length} sub-move${submoves.length === 1 ? "" : "s"}${metaSuffix}`}
       action={
         <IconBtn
           t={t}
@@ -2986,20 +3062,24 @@ const SubMovesetSection = ({ variant, updateVariant, character, t }) => {
         <div
           className={`rounded-lg border border-dashed ${t.border} ${t.soft} py-6 text-center ${t.faint} text-xs`}
         >
-          Awakenings can unlock a nested moveset. Add sub-moves here to
-          document the alternate kit available during this transformation.
+          {isAwakening
+            ? "Seeding 4 mandatory awakening moves\u2026"
+            : "Awakenings can unlock a nested moveset. Add sub-moves here to document the alternate kit available during this transformation."}
         </div>
       ) : (
         <div className="space-y-3">
-          {submoves.map((sm) => (
+          {submoves.map((sm, idx) => (
             <SubMoveCard
               key={sm.id}
               submove={sm}
+              isMandatory={isAwakening && idx < 4}
               updateSubmove={(updated) =>
                 setSubmoves(submoves.map((x) => (x.id === updated.id ? updated : x)))
               }
-              removeSubmove={() =>
-                setSubmoves(submoves.filter((x) => x.id !== sm.id))
+              removeSubmove={
+                isAwakening && idx < 4
+                  ? null
+                  : () => setSubmoves(submoves.filter((x) => x.id !== sm.id))
               }
               character={character}
               t={t}
@@ -3161,6 +3241,85 @@ const AddVariantInline = ({ move, onAdd, t }) => {
   );
 };
 
+const AddCustomSlotInline = ({ onAdd, t }) => {
+  const [open, setOpen] = useState(false);
+  const [label, setLabel] = useState("");
+  const [relation, setRelation] = useState("None");
+
+  const submit = () => {
+    if (!label.trim()) return;
+    onAdd(label.trim(), relation);
+    setLabel("");
+    setRelation("None");
+    setOpen(false);
+  };
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        className={`mt-3 w-full text-left text-[11px] px-2 py-1.5 rounded border border-dashed ${t.border} ${t.hover} ${t.sub} flex items-center gap-1`}
+      >
+        <Plus size={10} /> Add custom move slot
+      </button>
+    );
+  }
+
+  const relMeta = SLOT_RELATION_META[relation];
+
+  return (
+    <div className={`mt-3 rounded-lg border ${t.border} ${t.surface} p-2 space-y-2`}>
+      <div className={`text-[10px] uppercase tracking-wider ${t.faint} mb-1`}>New Move Slot</div>
+      <input
+        autoFocus
+        value={label}
+        onChange={(e) => setLabel(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && submit()}
+        placeholder="G Move, Z Move, Awakening…"
+        className={`w-full text-sm bg-transparent outline-none rounded border ${t.border} px-2 py-1 ${t.inputBg}`}
+      />
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className={`text-[11px] ${t.faint}`}>Relation:</span>
+        {SLOT_RELATIONS.map((r) => {
+          const m = SLOT_RELATION_META[r];
+          const active = relation === r;
+          return (
+            <button
+              key={r}
+              onClick={() => setRelation(r)}
+              className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${
+                active && m.cls ? m.cls : active ? t.chipActive : t.chipIdle
+              }`}
+            >
+              {r}
+            </button>
+          );
+        })}
+      </div>
+      {relation === "Awakening" && (
+        <p className="text-[10px] text-amber-400/80 italic">
+          Awakening slots auto-seed 4 mandatory submoves.
+        </p>
+      )}
+      <div className="flex gap-2">
+        <button
+          onClick={submit}
+          disabled={!label.trim()}
+          className={`flex-1 text-xs py-1.5 rounded-md border ${t.border} ${t.confirm} font-medium disabled:opacity-40`}
+        >
+          Add slot
+        </button>
+        <button
+          onClick={() => { setOpen(false); setLabel(""); setRelation("None"); }}
+          className={`text-xs px-3 py-1.5 rounded-md border ${t.border} ${t.hover} ${t.sub}`}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+};
+
 const MoveTree = ({
   character,
   updateCharacter,
@@ -3197,170 +3356,241 @@ const MoveTree = ({
     }
   };
 
+  const addCustomSlot = (label, relation) => {
+    const cs = makeCustomSlot(label, relation);
+    const newMove = makeMove("Attack", "Physical");
+    if (relation === "Awakening") {
+      newMove.variants[0].submoves = seedAwakeningSubmoves();
+    }
+    updateCharacter({
+      ...character,
+      customSlots: [...(character.customSlots || []), cs],
+      moves: { ...character.moves, [cs.key]: newMove },
+    });
+    setActiveMoveKey(cs.key);
+    setActiveVariantId(newMove.variants[0].id);
+    toggleExpanded(cs.key);
+  };
+
+  const removeCustomSlot = (key) => {
+    const newMoves = { ...character.moves };
+    delete newMoves[key];
+    updateCharacter({
+      ...character,
+      customSlots: (character.customSlots || []).filter((cs) => cs.key !== key),
+      moves: newMoves,
+    });
+    if (activeMoveKey === key) {
+      setActiveMoveKey("move1");
+      setActiveVariantId(character.moves.move1.variants[0]?.id);
+    }
+  };
+
+  const updateCustomSlotField = (key, patch) => {
+    updateCharacter({
+      ...character,
+      customSlots: (character.customSlots || []).map((cs) =>
+        cs.key === key ? { ...cs, ...patch } : cs
+      ),
+    });
+  };
+
+  const renderSlotRow = (slot, move, isCustom) => {
+    const isExpanded = expandedMoves.has(slot.key);
+    const isActiveMove = activeMoveKey === slot.key;
+    const relation = slot.relation || "None";
+    const relationMeta = SLOT_RELATION_META[relation];
+    const SlotIcon = slot.isFinisher
+      ? move.finisherKind === "Ultimate" ? Star : Sparkles
+      : iconForVariant(move.variants[0]);
+
+    return (
+      <div key={slot.key}>
+        <div
+          className={`group flex items-center gap-1 rounded-md px-1 py-1 transition-colors ${
+            isActiveMove ? t.accentBg : t.hover
+          }`}
+        >
+          <button
+            onClick={() => toggleExpanded(slot.key)}
+            className={`p-0.5 rounded ${t.hover}`}
+            title={isExpanded ? "Collapse variants" : "Expand variants"}
+          >
+            {isExpanded ? (
+              <ChevronDown size={13} className={t.sub} />
+            ) : (
+              <ChevronRight size={13} className={t.sub} />
+            )}
+          </button>
+          <button
+            onClick={() => {
+              setActiveMoveKey(slot.key);
+              if (!expandedMoves.has(slot.key)) toggleExpanded(slot.key);
+              if (move.variants[0]) setActiveVariantId(move.variants[0].id);
+            }}
+            className="flex-1 flex items-center gap-2 text-left min-w-0"
+          >
+            <SlotIcon size={13} className={isActiveMove ? t.accent : t.sub} />
+            <div className="flex-1 min-w-0">
+              <div className={`text-[11px] uppercase tracking-wider ${t.faint} leading-none flex items-center gap-1 flex-wrap`}>
+                {isCustom ? (
+                  <input
+                    value={slot.label}
+                    onChange={(e) => {
+                      e.stopPropagation();
+                      updateCustomSlotField(slot.key, { label: e.target.value });
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                    placeholder="Slot label"
+                    className={`bg-transparent outline-none min-w-0 max-w-[90px] ${t.hover} rounded px-0.5`}
+                  />
+                ) : (
+                  slotLabel(slot)
+                )}
+                {relation !== "None" && (
+                  <span className={`text-[9px] px-1 py-0.5 rounded border font-medium ${relationMeta.cls}`}>
+                    {relation}
+                  </span>
+                )}
+              </div>
+              <div className={`text-sm truncate ${isActiveMove ? `${t.accent} font-medium` : ""}`}>
+                {move.name || "Untitled"}
+              </div>
+            </div>
+            <span className={`text-[10px] ${t.faint} tabular-nums`}>
+              {move.variants.length}
+            </span>
+          </button>
+          {isCustom ? (
+            <>
+              <select
+                value={relation}
+                onChange={(e) => {
+                  e.stopPropagation();
+                  updateCustomSlotField(slot.key, { relation: e.target.value });
+                }}
+                title="Slot relation"
+                className={`text-[10px] bg-transparent outline-none border ${t.border} rounded px-1 py-0.5 ${t.inputBg} max-w-[70px]`}
+              >
+                {SLOT_RELATIONS.map((r) => (
+                  <option key={r} value={r}>{r}</option>
+                ))}
+              </select>
+              <ConfirmDelete
+                onConfirm={() => removeCustomSlot(slot.key)}
+                t={t}
+                icon={X}
+                size={11}
+                title={`Remove ${slot.label}`}
+              />
+            </>
+          ) : (
+            slot.removable && (
+              <ConfirmDelete
+                onConfirm={() => removeUtility(slot.key)}
+                t={t}
+                icon={X}
+                size={11}
+                title={`Remove ${slot.label}`}
+              />
+            )
+          )}
+        </div>
+
+        {isExpanded && (
+          <div className={`ml-6 pl-2 border-l ${t.subBorder} my-1`}>
+            {move.variants.map((v) => {
+              const isActiveVariant = activeMoveKey === slot.key && activeVariantId === v.id;
+              const VIcon = iconForVariant(v);
+              return (
+                <div
+                  key={v.id}
+                  className={`group flex items-center gap-2 px-2 py-1 rounded-md cursor-pointer transition-colors ${
+                    isActiveVariant ? t.accentBg : t.hover
+                  }`}
+                  onClick={() => {
+                    setActiveMoveKey(slot.key);
+                    setActiveVariantId(v.id);
+                  }}
+                >
+                  <Layers size={11} className={isActiveVariant ? t.accent : t.faint} />
+                  <div className="flex-1 min-w-0">
+                    <div className={`text-xs truncate ${isActiveVariant ? t.accent : ""}`}>
+                      {v.tag}
+                    </div>
+                    <div className={`text-[10px] ${t.faint} flex items-center gap-1`}>
+                      <VIcon size={9} />
+                      {v.subtype ? `${v.type} \u00b7 ${v.subtype}` : v.type}
+                    </div>
+                  </div>
+                  {move.variants.length > 1 && (
+                    <ConfirmDelete
+                      onConfirm={() => {
+                        const remaining = move.variants.filter((x) => x.id !== v.id);
+                        updateCharacter({
+                          ...character,
+                          moves: {
+                            ...character.moves,
+                            [slot.key]: { ...move, variants: remaining },
+                          },
+                        });
+                        if (activeMoveKey === slot.key && activeVariantId === v.id) {
+                          setActiveVariantId(remaining[0].id);
+                        }
+                      }}
+                      t={t}
+                      icon={X}
+                      size={10}
+                      title="Remove variant"
+                    />
+                  )}
+                </div>
+              );
+            })}
+            <AddVariantInline
+              move={move}
+              onAdd={(tag, type, subtype) => {
+                const nv = makeVariant(tag, type, subtype);
+                updateCharacter({
+                  ...character,
+                  moves: {
+                    ...character.moves,
+                    [slot.key]: { ...move, variants: [...move.variants, nv] },
+                  },
+                });
+                setActiveMoveKey(slot.key);
+                setActiveVariantId(nv.id);
+              }}
+              t={t}
+            />
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="px-3 py-3">
       <div className={`px-1 mb-2 text-[11px] uppercase tracking-wider ${t.faint}`}>
-        Moves · {character.name || "—"}
+        Moves &middot; {character.name || "\u2014"}
       </div>
       <div className="space-y-0.5">
         {slots.map((slot) => {
           const move = character.moves[slot.key];
-          const isExpanded = expandedMoves.has(slot.key);
-          const isActiveMove = activeMoveKey === slot.key;
-          const SlotIcon = slot.isFinisher
-            ? move.finisherKind === "Ultimate"
-              ? Star
-              : Sparkles
-            : iconForVariant(move.variants[0]);
-
-          return (
-            <div key={slot.key}>
-              <div
-                className={`group flex items-center gap-1 rounded-md px-1 py-1 transition-colors ${
-                  isActiveMove ? t.accentBg : t.hover
-                }`}
-              >
-                <button
-                  onClick={() => toggleExpanded(slot.key)}
-                  className={`p-0.5 rounded ${t.hover}`}
-                  title={isExpanded ? "Collapse variants" : "Expand variants"}
-                >
-                  {isExpanded ? (
-                    <ChevronDown size={13} className={t.sub} />
-                  ) : (
-                    <ChevronRight size={13} className={t.sub} />
-                  )}
-                </button>
-                <button
-                  onClick={() => {
-                    setActiveMoveKey(slot.key);
-                    if (!expandedMoves.has(slot.key))
-                      toggleExpanded(slot.key);
-                    if (move.variants[0])
-                      setActiveVariantId(move.variants[0].id);
-                  }}
-                  className="flex-1 flex items-center gap-2 text-left min-w-0"
-                >
-                  <SlotIcon
-                    size={13}
-                    className={isActiveMove ? t.accent : t.sub}
-                  />
-                  <div className="flex-1 min-w-0">
-                    <div
-                      className={`text-[11px] uppercase tracking-wider ${t.faint} leading-none`}
-                    >
-                      {slotLabel(slot)}
-                    </div>
-                    <div
-                      className={`text-sm truncate ${
-                        isActiveMove ? `${t.accent} font-medium` : ""
-                      }`}
-                    >
-                      {move.name || "Untitled"}
-                    </div>
-                  </div>
-                  <span className={`text-[10px] ${t.faint} tabular-nums`}>
-                    {move.variants.length}
-                  </span>
-                </button>
-                {slot.removable && (
-                  <ConfirmDelete
-                    onConfirm={() => removeUtility(slot.key)}
-                    t={t}
-                    icon={X}
-                    size={11}
-                    title={`Remove ${slot.label}`}
-                  />
-                )}
-              </div>
-
-              {isExpanded && (
-                <div className={`ml-6 pl-2 border-l ${t.subBorder} my-1`}>
-                  {move.variants.map((v) => {
-                    const isActiveVariant =
-                      activeMoveKey === slot.key &&
-                      activeVariantId === v.id;
-                    const VIcon = iconForVariant(v);
-                    return (
-                      <div
-                        key={v.id}
-                        className={`group flex items-center gap-2 px-2 py-1 rounded-md cursor-pointer transition-colors ${
-                          isActiveVariant ? t.accentBg : t.hover
-                        }`}
-                        onClick={() => {
-                          setActiveMoveKey(slot.key);
-                          setActiveVariantId(v.id);
-                        }}
-                      >
-                        <Layers
-                          size={11}
-                          className={isActiveVariant ? t.accent : t.faint}
-                        />
-                        <div className="flex-1 min-w-0">
-                          <div
-                            className={`text-xs truncate ${
-                              isActiveVariant ? t.accent : ""
-                            }`}
-                          >
-                            {v.tag}
-                          </div>
-                          <div className={`text-[10px] ${t.faint} flex items-center gap-1`}>
-                            <VIcon size={9} />
-                            {v.subtype ? `${v.type} · ${v.subtype}` : v.type}
-                          </div>
-                        </div>
-                        {move.variants.length > 1 && (
-                          <ConfirmDelete
-                            onConfirm={() => {
-                              const remaining = move.variants.filter(
-                                (x) => x.id !== v.id
-                              );
-                              updateCharacter({
-                                ...character,
-                                moves: {
-                                  ...character.moves,
-                                  [slot.key]: { ...move, variants: remaining },
-                                },
-                              });
-                              if (
-                                activeMoveKey === slot.key &&
-                                activeVariantId === v.id
-                              ) {
-                                setActiveVariantId(remaining[0].id);
-                              }
-                            }}
-                            t={t}
-                            icon={X}
-                            size={10}
-                            title="Remove variant"
-                          />
-                        )}
-                      </div>
-                    );
-                  })}
-                  <AddVariantInline
-                    move={move}
-                    onAdd={(tag, type, subtype) => {
-                      const nv = makeVariant(tag, type, subtype);
-                      updateCharacter({
-                        ...character,
-                        moves: {
-                          ...character.moves,
-                          [slot.key]: {
-                            ...move,
-                            variants: [...move.variants, nv],
-                          },
-                        },
-                      });
-                      setActiveMoveKey(slot.key);
-                      setActiveVariantId(nv.id);
-                    }}
-                    t={t}
-                  />
-                </div>
-              )}
-            </div>
-          );
+          return renderSlotRow(slot, move, false);
+        })}
+        {(character.customSlots || []).map((cs) => {
+          const slot = {
+            key: cs.key,
+            label: cs.label,
+            relation: cs.relation || "None",
+            removable: true,
+            isFinisher: false,
+            isCustom: true,
+          };
+          const move = character.moves[cs.key];
+          if (!move) return null;
+          return renderSlotRow(slot, move, true);
         })}
       </div>
 
@@ -3382,9 +3612,12 @@ const MoveTree = ({
           ))}
         </div>
       )}
+
+      <AddCustomSlotInline onAdd={addCustomSlot} t={t} />
     </div>
   );
 };
+
 
 /* ===========================================================================
  * Character Profile Header
@@ -4093,7 +4326,20 @@ const VariantEditor = ({
   t,
 }) => {
   const move = character.moves[moveKey];
-  const slot = DEFAULT_SLOTS.find((s) => s.key === moveKey);
+  // Resolve slot from both fixed and custom lists
+  const fixedSlot = DEFAULT_SLOTS.find((s) => s.key === moveKey);
+  const customSlotDef = (character.customSlots || []).find((cs) => cs.key === moveKey);
+  const slot = fixedSlot ||
+    (customSlotDef
+      ? { key: moveKey, label: customSlotDef.label, isFinisher: false, removable: true, isCustom: true }
+      : { key: moveKey, label: moveKey, isFinisher: false, removable: false, isCustom: false });
+
+  // Derive the slot's relation type
+  const slotRelation = fixedSlot?.key === "awakening"
+    ? "Awakening"
+    : customSlotDef?.relation || "None";
+  const isAwakening = slotRelation === "Awakening";
+  const relationMeta = SLOT_RELATION_META[slotRelation];
 
   const updateMove = (m) =>
     updateCharacter({
@@ -4121,10 +4367,15 @@ const VariantEditor = ({
         >
           <SlotIcon size={16} />
         </div>
-        <div className={`text-[11px] uppercase tracking-wider ${t.faint}`}>
+        <div className={`text-[11px] uppercase tracking-wider ${t.faint} flex items-center gap-2`}>
           {slot.isFinisher
-            ? `${move.finisherKind || "Awakening"} · ${variant.tag}`
-            : `${slot.label} · ${variant.tag}`}
+            ? `${move.finisherKind || "Awakening"} \u00b7 ${variant.tag}`
+            : `${slot.label} \u00b7 ${variant.tag}`}
+          {slotRelation !== "None" && (
+            <span className={`text-[9px] px-1.5 py-0.5 rounded border font-medium ${relationMeta.cls}`}>
+              {slotRelation}
+            </span>
+          )}
         </div>
 
         {slot.isFinisher && (
@@ -4264,7 +4515,9 @@ const VariantEditor = ({
           excludeVariantId={variant.id}
         />
 
-        {variant.type === "Special" && variant.subtype === "Awakening" && (
+        {/* Show sub-moveset section for Awakening slots (mandatory 4)
+            OR for variants typed as Special/Awakening (existing behavior) */}
+        {(isAwakening || (variant.type === "Special" && variant.subtype === "Awakening")) && (
           <>
             <SectionGroup label="Sub-Moveset" t={t} />
             <SubMovesetSection
@@ -4272,6 +4525,7 @@ const VariantEditor = ({
               updateVariant={updateVariant}
               character={character}
               t={t}
+              isAwakening={isAwakening}
             />
           </>
         )}
