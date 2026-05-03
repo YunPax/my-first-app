@@ -98,19 +98,24 @@ const MOVE_TYPES = {
     classification: [
       { key: "status", label: "Status Affliction", options: STATUSES },
       {
-        key: "hitProperty",
-        label: "Hit Property",
-        options: ["High", "Mid", "Low", "Overhead", "Unblockable"],
-      },
-      {
         key: "stunType",
         label: "Stun Type",
-        options: ["Normal", "Spin", "Wall", "Downslam", "Uptilt"],
+        options: ["Normal", "Spin", "Wall", "Downslam", "Uptilt", "Ragdoll"],
       },
       {
         key: "blockable",
-        label: "Blockable?",
-        options: ["Yes", "No", "Only with parry"],
+        label: "Block Status",
+        options: ["Blockable", "BypassBlock", "Block Break"],
+      },
+      {
+        key: "ragdollStatus",
+        label: "Ragdoll Status",
+        options: ["None", "BypassRagdoll"],
+      },
+      {
+        key: "armor",
+        label: "Armor",
+        options: ["None", "Superarmor", "Hyperarmor", "Iframes"],
       },
       {
         key: "cutscene",
@@ -132,14 +137,9 @@ const MOVE_TYPES = {
      * full schema split.                                                   */
     subtypeSpec: {
       Physical: [
-        { key: "reach", label: "Reach (studs)", placeholder: "5" },
-        {
-          key: "hitCount",
-          label: "Hit Count",
-          kind: "picker",
-          options: ["Single", "2 hits", "3 hits", "4+ hits"],
-        },
-        { key: "pushback", label: "Pushback (studs)", placeholder: "3" },
+        { key: "reach", label: "Travel Distance (studs)", placeholder: "5" },
+        { key: "hitCount", label: "Hit Count", placeholder: "1" },
+        { key: "hitLimit", label: "Hit Limit (targets)", placeholder: "1" },
       ],
       Projectile: [
         {
@@ -511,8 +511,7 @@ const makeVariant = (tag = "Ground", type = "Attack", subtype = null) => {
     markers: seedMarkersForType(primary),
     media: [],
     flavor: "",
-    combo: "",
-    scaling: "",
+    combo: { general: "", specific: [] },
     conditions: [],
   };
 };
@@ -788,16 +787,17 @@ const hasStunData = (s) => s && typeof s === "object" && (s.duration || s.priori
 const hasEndlagData = (e) => e && typeof e === "object" && (e.success || e.fail);
 const hasHitboxData = (h) => {
   if (!h || typeof h !== "object") return false;
-  if (h.mode === "Radius") return !!h.radius;
-  return !!(h.x || h.y || h.z || h.offsetX || h.offsetY || h.offsetZ);
+  if (h.mode === "Radius") return !!(h.radius || h.frames || h.hitboxDuration);
+  return !!(h.x || h.y || h.z || h.offsetX || h.offsetY || h.offsetZ || h.frames || h.hitboxDuration);
 };
 
 /* Map classification field keys to the PascalCase names we emit in Luau.  */
 const CLASSIFICATION_EMIT = {
   status: "Status",
-  hitProperty: "HitProperty",
   stunType: "StunType",
-  blockable: "Blockable",
+  blockable: "BlockStatus",
+  ragdollStatus: "RagdollStatus",
+  armor: "Armor",
   cutscene: "Cutscene",
   target: "Target",
   iframes: "IFrames",
@@ -825,7 +825,7 @@ const SPEC_EMIT_NAME = {
   // Attack subtypes
   reach: "Reach",
   hitCount: "HitCount",
-  pushback: "Pushback",
+  hitLimit: "HitLimit",
   trajectory: "Trajectory",
   aimMode: "AimMode",
   projectileCount: "ProjectileCount",
@@ -947,34 +947,71 @@ const characterToLuau = (character) => {
     push(`${I}MoveType = ${luaString(v.type || "Attack")},`);
     if (v.subtype) {
       push(`${I}${subtypeFieldFor(v.type || "Attack")} = ${luaString(v.subtype)},`);
+      // DamageType from subtype for HitHandler
+      push(`${I}DamageType = ${luaString(v.subtype)},`);
     }
 
     // Classification — fields filtered by current MOVE_TYPES schema
+    // Special handling: blockable → BypassBlock/GuardBreak booleans,
+    //                   ragdollStatus → BypassRagdoll boolean,
+    //                   armor → Armor field
     const classFields = MOVE_TYPES[v.type || "Attack"]?.classification || [];
     for (const field of classFields) {
+      const val = v.classification?.[field.key];
+      if (!val || val === "None" || val === "\u2026" || val === "N/A") continue;
+
+      // Block Status → emit booleans matching HitHandler
+      if (field.key === "blockable") {
+        if (val === "BypassBlock") push(`${I}BypassBlock = true,`);
+        else if (val === "Block Break") push(`${I}GuardBreak = true,`);
+        // "Blockable" is default — don't emit
+        continue;
+      }
+      // Ragdoll Status → emit boolean
+      if (field.key === "ragdollStatus") {
+        if (val === "BypassRagdoll") push(`${I}BypassRagdoll = true,`);
+        continue;
+      }
+      // Armor → emit armor type for GiveArmor
+      if (field.key === "armor") {
+        push(`${I}Armor = ${luaString(val)},`);
+        continue;
+      }
+
       const emitName = CLASSIFICATION_EMIT[field.key];
       if (!emitName) continue;
-      const val = v.classification?.[field.key];
-      if (val && val !== "None") {
-        push(`${I}${emitName} = ${luaString(val)},`);
-      }
+      push(`${I}${emitName} = ${luaString(val)},`);
     }
 
     // References to local tables (top-level only — submoves go inline)
+    // Stun special handling: Ragdoll stunType → emit Ragdoll = duration
+    const stunType = v.classification?.stunType;
+    const isRagdollStun = stunType === "Ragdoll";
     if (useLocals) {
       if (sp.damage) push(`${I}Damage = Damages.${fullKey},`);
       if (sp.reactionDamage) push(`${I}ReactionDamage = Damages.${fullKey},`);
-      if (hasStunData(sp.stun)) push(`${I}Stun = Stuns.${fullKey},`);
+      if (hasStunData(sp.stun)) {
+        if (isRagdollStun) {
+          push(`${I}Ragdoll = Stuns.${fullKey}.Duration,`);
+          if (sp.stun.canNormalHit) push(`${I}BypassRagdollOnNextHit = true,`);
+        } else {
+          push(`${I}Stun = Stuns.${fullKey},`);
+        }
+      }
       if (sp.cooldown) push(`${I}Cooldown = Cooldowns.${fullKey},`);
       if (hasEndlagData(sp.endlag)) push(`${I}Endlag = Endlag.${fullKey},`);
     } else {
-      // Submoves: inline scalar values directly so the parent variant is
-      // self-contained (no local-table indirection at nested scope).
+      // Submoves: inline scalar values directly
       if (sp.damage) push(`${I}Damage = ${luaNum(sp.damage)},`);
       if (sp.reactionDamage) push(`${I}ReactionDamage = ${luaNum(sp.reactionDamage)},`);
       if (sp.cooldown) push(`${I}Cooldown = ${luaNum(sp.cooldown)},`);
       if (hasStunData(sp.stun)) {
-        push(`${I}Stun = { Duration = ${luaNum(sp.stun.duration)}, Priority = ${luaNum(sp.stun.priority, 1)} },`);
+        if (isRagdollStun) {
+          push(`${I}Ragdoll = ${luaNum(sp.stun.duration)},`);
+          if (sp.stun.canNormalHit) push(`${I}BypassRagdollOnNextHit = true,`);
+        } else {
+          push(`${I}Stun = { Duration = ${luaNum(sp.stun.duration)}, Priority = ${luaNum(sp.stun.priority, 1)} },`);
+        }
       }
       if (hasEndlagData(sp.endlag)) {
         push(`${I}Endlag = { Success = ${luaNum(sp.endlag.success)}, Fail = ${luaNum(sp.endlag.fail)} },`);
@@ -1000,12 +1037,13 @@ const characterToLuau = (character) => {
         const emitName = SPEC_EMIT_NAME[field.key];
         if (!emitName) continue;
         const val = sp[field.key];
-        if (val == null || val === "") continue;
+        if (val == null || val === "" || val === "\u2026" || val === "N/A") continue;
         if (field.kind === "picker") {
           push(`${I}${emitName} = ${luaString(val)},`);
         } else {
           const n = parseFloat(val);
           if (Number.isFinite(n) && /^-?\d*\.?\d+%?$/.test(String(val).trim()) && !String(val).trim().endsWith("%")) {
+            if (n === 0) continue; // Skip zero values
             push(`${I}${emitName} = ${n},`);
           } else {
             push(`${I}${emitName} = ${luaString(val)},`);
@@ -1030,6 +1068,8 @@ const characterToLuau = (character) => {
           );
         }
       }
+      if (h.frames) push(`${I}\tFrames = ${luaNum(h.frames)},`);
+      if (h.hitboxDuration) push(`${I}\tDuration = ${luaNum(h.hitboxDuration)},`);
       push(`${I}},`);
     }
 
@@ -2044,30 +2084,51 @@ const ClassificationSection = ({ variant, updateVariant, t }) => {
 /* Composite spec-field editors — each is a fragment that writes back into
  * the owning variant's `spec[field.key]` object. */
 
-const StunSpecEditor = ({ value, onChange, t }) => {
+const StunSpecEditor = ({ value, onChange, t, stunType }) => {
   const v = value && typeof value === "object" ? value : {};
+  const isRagdoll = stunType === "Ragdoll";
   return (
-    <div className="flex items-center gap-2 px-2 py-1">
-      <span className={`text-[10px] uppercase tracking-wider ${t.faint} w-16`}>
-        Duration
-      </span>
-      <Field
-        value={v.duration}
-        onChange={(x) => onChange({ ...v, duration: x })}
-        placeholder="0.65"
-        t={t}
-        className="font-mono text-sm tabular-nums flex-1"
-      />
-      <span className={`text-[10px] uppercase tracking-wider ${t.faint} w-16`}>
-        Priority
-      </span>
-      <Field
-        value={v.priority}
-        onChange={(x) => onChange({ ...v, priority: x })}
-        placeholder="1"
-        t={t}
-        className="font-mono text-sm tabular-nums flex-1"
-      />
+    <div className="px-2 py-1 space-y-2">
+      <div className="flex items-center gap-2">
+        <span className={`text-[10px] uppercase tracking-wider ${t.faint} w-16`}>
+          {isRagdoll ? "Ragdoll" : "Duration"}
+        </span>
+        <Field
+          value={v.duration}
+          onChange={(x) => onChange({ ...v, duration: x })}
+          placeholder={isRagdoll ? "2.0" : "0.65"}
+          t={t}
+          className="font-mono text-sm tabular-nums flex-1"
+        />
+        <span className={`text-[10px] uppercase tracking-wider ${t.faint} w-16`}>
+          Priority
+        </span>
+        <Field
+          value={v.priority}
+          onChange={(x) => onChange({ ...v, priority: x })}
+          placeholder="1"
+          t={t}
+          className="font-mono text-sm tabular-nums flex-1"
+        />
+      </div>
+      {isRagdoll && (
+        <div className="flex items-center gap-2">
+          <span className={`text-[10px] uppercase tracking-wider ${t.faint} w-24`}>
+            Can Normal-Hit?
+          </span>
+          <button
+            onClick={() => onChange({ ...v, canNormalHit: !v.canNormalHit })}
+            className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${
+              v.canNormalHit ? t.chipActive : t.chipIdle
+            }`}
+          >
+            {v.canNormalHit ? "Yes" : "No"}
+          </button>
+          <span className={`text-[10px] ${t.faint} italic`}>
+            Sets BypassRagdollOnNextHit so M1 can connect
+          </span>
+        </div>
+      )}
     </div>
   );
 };
@@ -2122,6 +2183,30 @@ const HitboxSpecEditor = ({ value, onChange, t }) => {
             ? "Vector3.new(x, y, z)"
             : "single-number sphere radius"}
         </span>
+      </div>
+
+      {/* Frames / Duration row */}
+      <div className="flex items-center gap-2">
+        <span className={`text-[10px] uppercase tracking-wider ${t.faint} w-16`}>
+          Frames
+        </span>
+        <Field
+          value={v.frames}
+          onChange={(x) => onChange({ ...v, frames: x })}
+          placeholder="6"
+          t={t}
+          className="font-mono text-sm tabular-nums flex-1"
+        />
+        <span className={`text-[10px] uppercase tracking-wider ${t.faint} w-16`}>
+          Duration
+        </span>
+        <Field
+          value={v.hitboxDuration}
+          onChange={(x) => onChange({ ...v, hitboxDuration: x })}
+          placeholder="0.25"
+          t={t}
+          className="font-mono text-sm tabular-nums flex-1"
+        />
       </div>
 
       {mode === "Size" ? (
@@ -2193,6 +2278,7 @@ const SpecSheet = ({ variant, updateVariant, t }) => {
           value={variant.spec[field.key]}
           onChange={(v) => setSpec(field.key, v)}
           t={t}
+          stunType={variant.classification?.stunType}
         />
       );
     }
@@ -2470,31 +2556,151 @@ const FlavorBlock = ({ variant, updateVariant, t }) => (
   </Toggle>
 );
 
-const ComboSynergy = ({ variant, updateVariant, t }) => (
-  <Toggle title="Combo Synergy" icon={GitBranch} t={t}>
-    <Area
-      value={variant.combo}
-      onChange={(v) => updateVariant({ ...variant, combo: v })}
-      placeholder="What does this cancel into? What chains with it? Any meter or state requirements?"
-      rows={4}
-      t={t}
-      className={`text-sm ${t.sub}`}
-    />
-  </Toggle>
-);
+const ComboSynergy = ({ variant, updateVariant, character, t, excludeVariantId }) => {
+  // Migrate old string combo to new structure
+  const combo = variant.combo && typeof variant.combo === "object"
+    ? variant.combo
+    : { general: typeof variant.combo === "string" ? variant.combo : "", specific: [] };
 
-const ScalingLogic = ({ variant, updateVariant, t }) => (
-  <Toggle title="Scaling Logic" icon={Gauge} t={t}>
-    <Area
-      value={variant.scaling}
-      onChange={(v) => updateVariant({ ...variant, scaling: v })}
-      placeholder="How does damage / effect strength scale based on combo position?"
-      rows={3}
-      t={t}
-      className={`text-sm ${t.sub}`}
-    />
-  </Toggle>
-);
+  const updateCombo = (patch) =>
+    updateVariant({ ...variant, combo: { ...combo, ...patch } });
+
+  const addSpecific = (catalogItem) => {
+    updateCombo({
+      specific: [
+        ...combo.specific,
+        {
+          id: newId(),
+          targetId: catalogItem.targetId,
+          kind: catalogItem.kind,
+          label: catalogItem.label,
+          note: "",
+        },
+      ],
+    });
+  };
+
+  const removeSpecific = (id) =>
+    updateCombo({ specific: combo.specific.filter((s) => s.id !== id) });
+
+  const updateSpecific = (id, patch) =>
+    updateCombo({
+      specific: combo.specific.map((s) => (s.id === id ? { ...s, ...patch } : s)),
+    });
+
+  const catalog = buildReferenceCatalog(character, excludeVariantId);
+  const usedIds = new Set(combo.specific.map((s) => s.targetId));
+  const available = catalog.filter((c) => !usedIds.has(c.targetId));
+
+  const [pickerOpen, setPickerOpen] = useState(false);
+
+  return (
+    <Toggle title="Combo Synergy" icon={GitBranch} t={t} meta={`${combo.specific.length} links`}>
+      {/* General synergy */}
+      <div className="mb-3">
+        <div className={`text-[10px] uppercase tracking-wider ${t.faint} mb-1`}>
+          General Combo Notes
+        </div>
+        <Area
+          value={combo.general}
+          onChange={(v) => updateCombo({ general: v })}
+          placeholder="General combo chains, cancels, meter requirements…"
+          rows={3}
+          t={t}
+          className={`text-sm ${t.sub}`}
+        />
+      </div>
+
+      {/* Specific synergies */}
+      <div className={`text-[10px] uppercase tracking-wider ${t.faint} mb-1`}>
+        Specific Synergies
+      </div>
+      {combo.specific.length === 0 ? (
+        <div className={`text-xs ${t.faint} italic mb-2`}>
+          No specific synergies yet — add one below.
+        </div>
+      ) : (
+        <div className={`rounded-lg border ${t.border} overflow-hidden mb-2`}>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className={`${t.surfaceAlt} ${t.sub}`}>
+                <th className="text-left px-3 py-1.5 text-[10px] uppercase tracking-wider">Target</th>
+                <th className="text-left px-3 py-1.5 text-[10px] uppercase tracking-wider">Note</th>
+                <th className="w-8"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {combo.specific.map((s) => {
+                const meta = REFERENCE_KIND_META[s.kind] || REFERENCE_KIND_META.variant;
+                const KindIcon = meta.Icon;
+                return (
+                  <tr key={s.id} className={`border-t ${t.subBorder}`}>
+                    <td className="px-2 py-1">
+                      <div className="flex items-center gap-1.5">
+                        <KindIcon size={11} className={t.accent} />
+                        <span className="text-xs truncate max-w-[180px]">{s.label}</span>
+                      </div>
+                    </td>
+                    <td className="px-2 py-1">
+                      <Field
+                        value={s.note}
+                        onChange={(v) => updateSpecific(s.id, { note: v })}
+                        placeholder="Chains after hit 2…"
+                        t={t}
+                        className="text-xs"
+                      />
+                    </td>
+                    <td className="px-1">
+                      <ConfirmDelete onConfirm={() => removeSpecific(s.id)} t={t} icon={X} size={12} />
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Picker */}
+      {pickerOpen ? (
+        <div className={`rounded-lg border ${t.border} p-2 space-y-1 max-h-40 overflow-auto`}>
+          {available.length === 0 ? (
+            <div className={`text-xs ${t.faint} italic`}>No more targets available.</div>
+          ) : (
+            available.map((item) => {
+              const meta = REFERENCE_KIND_META[item.kind] || REFERENCE_KIND_META.variant;
+              const KindIcon = meta.Icon;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => { addSpecific(item); setPickerOpen(false); }}
+                  className={`w-full text-left text-xs px-2 py-1 rounded ${t.hover} flex items-center gap-1.5`}
+                >
+                  <KindIcon size={10} className={t.accent} />
+                  <span className="truncate">{item.label}</span>
+                  <span className={`text-[9px] ${t.faint} ml-auto`}>{meta.label}</span>
+                </button>
+              );
+            })
+          )}
+          <button
+            onClick={() => setPickerOpen(false)}
+            className={`text-[10px] ${t.faint} mt-1`}
+          >
+            Cancel
+          </button>
+        </div>
+      ) : (
+        <button
+          onClick={() => setPickerOpen(true)}
+          className={`text-xs px-3 py-1.5 rounded-md border ${t.border} ${t.hover} inline-flex items-center gap-1 ${t.sub}`}
+        >
+          <Plus size={12} /> Add specific synergy
+        </button>
+      )}
+    </Toggle>
+  );
+};
 
 /* ===========================================================================
  * Variable Interactions — spec-sheet section that lets this variant bind
@@ -4535,8 +4741,13 @@ const VariantEditor = ({
 
         <SectionGroup label="Notes" t={t} />
         <FlavorBlock variant={variant} updateVariant={updateVariant} t={t} />
-        <ComboSynergy variant={variant} updateVariant={updateVariant} t={t} />
-        <ScalingLogic variant={variant} updateVariant={updateVariant} t={t} />
+        <ComboSynergy
+          variant={variant}
+          updateVariant={updateVariant}
+          character={character}
+          t={t}
+          excludeVariantId={variant.id}
+        />
       </div>
     </div>
   );
