@@ -37,6 +37,9 @@ import {
   Search,
   Menu,
   Loader,
+  Eye,
+  EyeOff,
+  Activity,
 } from "lucide-react";
 
 /* ===========================================================================
@@ -569,6 +572,17 @@ const makeCharacter = (overrides = {}) => ({
   name: "New Character",
   anime: "Untitled Anime",
   gimmick: "",
+  /* General stats — M1 combos, speeds, etc. Emitted at the top of the Luau
+   * module's Stats table so the game can read them directly.                */
+  stats: {
+    m1Count: "5",
+    requiredMode: "100",
+    walkSpeed: "16",
+    runSpeed: "24",
+    jumpPower: "50",
+    crouchSpeed: "8",
+    slowWalkSpeed: "9.6",
+  },
   enabledSlots: ["move1", "move2", "move3", "move4", "utility", "awakening"],
   moves: {
     move1: makeMove("Attack", "Physical"),
@@ -579,6 +593,10 @@ const makeCharacter = (overrides = {}) => ({
     awakening: makeFinisher("Awakening"),
   },
   passives: [],
+  /* Disabled moves and passives — still visible in the editor but
+   * excluded from the Luau export. Stored as arrays of keys/ids.           */
+  disabledMoves: [],
+  disabledPassives: [],
   /* Array of { key, label, relation } for user-created slots beyond the
    * fixed move1-move4 / utility / awakening set.                        */
   customSlots: [],
@@ -869,9 +887,12 @@ const SPEC_HANDLED_KEYS = new Set([
 ]);
 
 const characterToLuau = (character) => {
+  const disabledMoveSet = new Set(character.disabledMoves || []);
+  const disabledPassiveSet = new Set(character.disabledPassives || []);
+
   const slotMoves = getAllSlots(character)
     .map((s) => ({ slot: s, move: character.moves[s.key] }))
-    .filter((sm) => sm.move != null);
+    .filter((sm) => sm.move != null && !disabledMoveSet.has(sm.slot.key));
 
   const cooldowns = [];
   const damages = [];
@@ -1188,7 +1209,7 @@ const characterToLuau = (character) => {
 
   // Mechanics (passives) live in their own local table. Each passive has
   // its own variables dictionary so gameplay code can read/write them.
-  const passives = character.passives || [];
+  const passives = (character.passives || []).filter((p) => !disabledPassiveSet.has(p.id));
   push(`local Mechanics = {`);
   if (passives.length === 0) push(`\t-- (none)`);
   for (const p of passives) {
@@ -1242,6 +1263,28 @@ const characterToLuau = (character) => {
   push(`\tName = ${luaString(character.name || "Character")},`);
   if (character.anime) push(`\tSource = ${luaString(character.anime)},`);
   push();
+
+  // Stats table — general character properties
+  const st = character.stats || {};
+  const statEntries = [
+    ["M1Count", st.m1Count],
+    ["RequiredMode", st.requiredMode],
+    ["WalkSpeed", st.walkSpeed],
+    ["RunSpeed", st.runSpeed],
+    ["JumpPower", st.jumpPower],
+    ["CrouchSpeed", st.crouchSpeed],
+    ["SlowWalkSpeed", st.slowWalkSpeed],
+  ].filter(([, v]) => v && v !== "0" && v !== "" && v !== "\u2026" && v !== "N/A");
+  if (statEntries.length) {
+    push(`\tStats = {`);
+    for (const [name, val] of statEntries) {
+      const n = parseFloat(val);
+      push(`\t\t${name} = ${Number.isFinite(n) ? n : luaString(val)},`);
+    }
+    push(`\t},`);
+    push();
+  }
+
   push(`\t-- Expose local tables on Info for external access`);
   push(`\tCooldowns = Cooldowns,`);
   push(`\tDamages = Damages,`);
@@ -3606,16 +3649,28 @@ const MoveTree = ({
     const isActiveMove = activeMoveKey === slot.key;
     const relation = slot.relation || "None";
     const relationMeta = SLOT_RELATION_META[relation];
+    const isDisabled = (character.disabledMoves || []).includes(slot.key);
     const SlotIcon = slot.isFinisher
       ? move.finisherKind === "Ultimate" ? Star : Sparkles
       : iconForVariant(move.variants[0]);
+
+    const toggleMoveDisabled = (e) => {
+      e.stopPropagation();
+      const current = character.disabledMoves || [];
+      updateCharacter({
+        ...character,
+        disabledMoves: isDisabled
+          ? current.filter((k) => k !== slot.key)
+          : [...current, slot.key],
+      });
+    };
 
     return (
       <div key={slot.key}>
         <div
           className={`group flex items-center gap-1 rounded-md px-1 py-1 transition-colors ${
             isActiveMove ? t.accentBg : t.hover
-          }`}
+          } ${isDisabled ? "opacity-40" : ""}`}
         >
           <button
             onClick={() => toggleExpanded(slot.key)}
@@ -3669,6 +3724,13 @@ const MoveTree = ({
           </button>
           {isCustom ? (
             <>
+              <button
+                onClick={toggleMoveDisabled}
+                className={`p-0.5 rounded ${t.hover} opacity-0 group-hover:opacity-100 transition-opacity`}
+                title={isDisabled ? "Enable move" : "Disable move (excluded from Luau)"}
+              >
+                {isDisabled ? <EyeOff size={11} className={t.faint} /> : <Eye size={11} className={t.faint} />}
+              </button>
               <select
                 value={relation}
                 onChange={(e) => {
@@ -3691,15 +3753,24 @@ const MoveTree = ({
               />
             </>
           ) : (
-            slot.removable && (
-              <ConfirmDelete
-                onConfirm={() => removeUtility(slot.key)}
-                t={t}
-                icon={X}
-                size={11}
-                title={`Remove ${slot.label}`}
-              />
-            )
+            <div className="flex items-center gap-0.5">
+              <button
+                onClick={toggleMoveDisabled}
+                className={`p-0.5 rounded ${t.hover} opacity-0 group-hover:opacity-100 transition-opacity`}
+                title={isDisabled ? "Enable move" : "Disable move (excluded from Luau)"}
+              >
+                {isDisabled ? <EyeOff size={11} className={t.faint} /> : <Eye size={11} className={t.faint} />}
+              </button>
+              {slot.removable && (
+                <ConfirmDelete
+                  onConfirm={() => removeUtility(slot.key)}
+                  t={t}
+                  icon={X}
+                  size={11}
+                  title={`Remove ${slot.label}`}
+                />
+              )}
+            </div>
           )}
         </div>
 
@@ -3919,6 +3990,49 @@ const CharacterHeader = ({ character, updateCharacter, goToRoster, t }) => (
     />
 
     <div className="mt-6 space-y-3">
+      <Toggle title="General Stats" icon={Activity} t={t} meta="Character properties">
+        {(() => {
+          const stats = character.stats || {};
+          const setStat = (key, v) =>
+            updateCharacter({ ...character, stats: { ...stats, [key]: v } });
+          const STAT_FIELDS = [
+            { key: "m1Count", label: "M1 Combo Count", placeholder: "5" },
+            { key: "requiredMode", label: "Required Mode Points", placeholder: "100" },
+            { key: "walkSpeed", label: "Walk Speed", placeholder: "16" },
+            { key: "runSpeed", label: "Run Speed", placeholder: "24" },
+            { key: "jumpPower", label: "Jump Power", placeholder: "50" },
+            { key: "crouchSpeed", label: "Crouch Speed", placeholder: "8" },
+            { key: "slowWalkSpeed", label: "Slow Walk Speed", placeholder: "9.6" },
+          ];
+          return (
+            <div className={`rounded-lg border ${t.border} overflow-hidden`}>
+              <table className="w-full text-sm">
+                <tbody>
+                  {STAT_FIELDS.map((field, i) => (
+                    <tr
+                      key={field.key}
+                      className={i !== STAT_FIELDS.length - 1 ? `border-b ${t.subBorder}` : ""}
+                    >
+                      <td className={`w-1/2 px-3 py-2 ${t.sub} text-xs uppercase tracking-wider`}>
+                        {field.label}
+                      </td>
+                      <td className="px-2 py-1">
+                        <Field
+                          value={stats[field.key]}
+                          onChange={(v) => setStat(field.key, v)}
+                          placeholder={field.placeholder}
+                          t={t}
+                          className="font-mono text-sm tabular-nums"
+                        />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
+        })()}
+      </Toggle>
       <Toggle title="Core Gimmick" icon={Sparkles} t={t}>
         <Area
           value={character.gimmick}
@@ -4002,9 +4116,9 @@ const PassiveVariableEditor = ({ passive, variable, updatePassive, t }) => {
   );
 };
 
-const PassiveCard = ({ passive, updatePassive, removePassive, character, t }) => {
+const PassiveCard = ({ passive, updatePassive, removePassive, character, t, isDisabled, toggleDisabled }) => {
   return (
-    <div className={`rounded-lg border ${t.border} ${t.surface}`}>
+    <div className={`rounded-lg border ${t.border} ${t.surface} ${isDisabled ? "opacity-40" : ""}`}>
       <div className={`flex items-center gap-2 px-3 py-2 border-b ${t.subBorder}`}>
         <Star size={14} className={t.accent} />
         <input
@@ -4013,6 +4127,13 @@ const PassiveCard = ({ passive, updatePassive, removePassive, character, t }) =>
           placeholder="Passive name"
           className={`flex-1 bg-transparent outline-none text-sm font-medium rounded px-1 ${t.hover}`}
         />
+        <button
+          onClick={toggleDisabled}
+          className={`p-1 rounded ${t.hover}`}
+          title={isDisabled ? "Enable passive" : "Disable passive (excluded from Luau)"}
+        >
+          {isDisabled ? <EyeOff size={13} className={t.faint} /> : <Eye size={13} className={t.faint} />}
+        </button>
         <ConfirmDelete onConfirm={removePassive} t={t} title="Delete passive" />
       </div>
       <div className="p-3 space-y-2">
@@ -4140,16 +4261,30 @@ const PassivesPanel = ({ character, updateCharacter, t }) => {
         </div>
       ) : (
         <div className="space-y-3">
-          {passives.map((p) => (
-            <PassiveCard
-              key={p.id}
-              passive={p}
-              updatePassive={updatePassive}
-              removePassive={() => removePassive(p.id)}
-              character={character}
-              t={t}
-            />
-          ))}
+          {passives.map((p) => {
+            const isDisabled = (character.disabledPassives || []).includes(p.id);
+            const toggleDisabled = () => {
+              const current = character.disabledPassives || [];
+              updateCharacter({
+                ...character,
+                disabledPassives: isDisabled
+                  ? current.filter((id) => id !== p.id)
+                  : [...current, p.id],
+              });
+            };
+            return (
+              <PassiveCard
+                key={p.id}
+                passive={p}
+                updatePassive={updatePassive}
+                removePassive={() => removePassive(p.id)}
+                character={character}
+                t={t}
+                isDisabled={isDisabled}
+                toggleDisabled={toggleDisabled}
+              />
+            );
+          })}
         </div>
       )}
     </Toggle>
